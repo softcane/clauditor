@@ -10,8 +10,6 @@ If you only run one short Claude session now and then, this is probably too much
 
 ![Clauditor before and after](docs/before-after.png)
 
-Visual note: `docs/grafana-overview.png` is based on real local dashboard crops. The tmux and before/after images are still a bit illustrative and should eventually be replaced with newer captures. The asset plan lives in [docs/README.md](docs/README.md).
-
 ## Why people install this
 
 - **Multi-session mess.** You have several `claude` terminals open and no clear sense of which one is active, blocked, or drifting.
@@ -71,13 +69,17 @@ clauditor watch --tmux --url http://127.0.0.1:9091
 
 If you are not already inside tmux, Clauditor will bootstrap a tmux session for you. Detach with `Ctrl+b d`, and reattach later with `tmux attach -t clauditor-<pid>`.
 
+If you want the Grafana dashboard, open this directly in your browser:
+
+- Dashboard: [http://127.0.0.1:3000/d/clauditor-main](http://127.0.0.1:3000/d/clauditor-main)
+
 ### 5. Run `claude` like you normally do
 
 That is basically it. Work as usual, and Clauditor will show which session is active, which tools ran, whether cache expired, whether context is filling up, and whether a request silently fell back to another model.
 
 Optional trend view:
 
-- Grafana: [http://127.0.0.1:3000](http://127.0.0.1:3000)
+- Grafana dashboard: [http://127.0.0.1:3000/d/clauditor-main](http://127.0.0.1:3000/d/clauditor-main)
 - Anonymous viewer mode is enabled
 - Admin login is also provisioned as `admin` / `admin`
 
@@ -105,7 +107,7 @@ clauditor watch --url http://127.0.0.1:9091
 clauditor watch --session session_1776... --url http://127.0.0.1:9091
 ```
 
-If you subscribe after a session already started, Clauditor injects a synthetic `SessionStart` so the watcher still gets the session header and cleaned initial prompt.
+Replace `session_1776...` with a real session id from `/api/sessions`. If you subscribe after a session already started, Clauditor injects a synthetic `SessionStart` so the watcher still gets the session header and cleaned initial prompt.
 
 **Review recent sessions**
 
