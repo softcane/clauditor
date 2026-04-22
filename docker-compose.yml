@@ -1,0 +1,74 @@
+services:
+  envoy:
+    image: envoyproxy/envoy:v1.37.2
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - "127.0.0.1:10000:10000"
+    depends_on:
+      clauditor-core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/10000'"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  clauditor-core:
+    build:
+      context: ./clauditor-core
+      dockerfile: Dockerfile
+    expose:
+      - "50051"
+    ports:
+      - "127.0.0.1:9091:9090"
+    environment:
+      - RUST_LOG=info
+      - CLAUDITOR_SESSION_BUDGET_DOLLARS=0
+      - CLAUDITOR_SESSION_BUDGET_TOKENS=0
+      - CLAUDITOR_CIRCUIT_BREAKER_THRESHOLD=5
+    volumes:
+      - clauditor_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v3.11.2
+    ports:
+      - "127.0.0.1:9092:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    depends_on:
+      clauditor-core:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:13.0.1
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+
+volumes:
+  clauditor_data:
+  prometheus_data:
+  grafana_data:

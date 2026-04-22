@@ -1,0 +1,46 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Cargo
+# Note: Cargo.lock IS committed — this is an application workspace, not a
+# library, so pinning exact dep versions is the right call.
+
+# macOS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Runtime state — SQLite DB + docker volumes created locally during dev
+clauditor_data/
+prometheus_data/
+grafana_data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Envoy + Docker artifacts
+envoy/envoy.log
+docker-compose.override.yml
+.env
+.env.local
+
+# Demo recordings
+docs/demo.cast
+
+# Scratch / logs
+/tmp/clauditor-repro/
+*.log
+
+# Planning docs (not shipped per CLAUDE.md)
+internal_docs/
+wiki/*
+Agents.md
+CLAUDE.md
+.claude/
+.omx/
