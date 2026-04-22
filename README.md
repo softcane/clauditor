@@ -14,11 +14,13 @@ If you only run one short Claude session now and then, this is probably too much
 
 - **Multi-session mess.** You have several `claude` terminals open and no clear sense of which one is active, blocked, or drifting.
 - **Slow turns with no obvious cause.** Cache expiry, model fallback, tool churn, and context pressure all feel the same from the outside unless you can actually see them.
+- **A Grafana dashboard for trends.** Sometimes you do not want just the live tmux view, you want the Grafana dashboard to look at session and cost trends over time.
 - **Bad memory after the fact.** You want some lightweight recall about what a session was doing without saving the whole transcript.
 
 ## What you get in the first minute
 
 - **A live session view.** One tmux pane per active session, with activity state and recent events.
+- **A Grafana trend view.** A dashboard for session, quality, and estimated cost trends over time.
 - **Useful debug signals.** Cache TTL, context fill, turns-to-compact, fallback detection, and session diagnosis.
 - **Simple history.** Recent sessions, cleaned first prompt, compact final summary, and JSON APIs if you want to script around it.
 
@@ -151,66 +153,6 @@ curl -s http://127.0.0.1:9091/metrics | grep '^clauditor_'
 
 If your only goal is token accounting, Clauditor is probably more stack than you need.
 
-## Advanced features
-
-<details>
-<summary>Estimated cost, pricing catalogs, and budget guardrails</summary>
-
-Most Claude Code users are on subscription plans, so this is not the main reason to run Clauditor. But if you use API keys directly, or you want advisory cost estimates, the plumbing is there.
-
-Use a contract pricebook:
-
-```bash
-cat > /tmp/clauditor-pricing.toml <<'TOML'
-source_label = "contract_2026q2"
-trusted_for_budget_enforcement = true
-
-[family.sonnet]
-input = 2.10
-output = 10.50
-cache_read = 0.21
-cache_create = 2.63
-
-[family.opus]
-input = 12.00
-output = 60.00
-cache_read = 1.20
-cache_create = 15.00
-TOML
-
-export CLAUDITOR_PRICING_FILE=/tmp/clauditor-pricing.toml
-docker compose up -d
-```
-
-Import billed truth for a session:
-
-```bash
-clauditor reconcile \
-  --session session_1776... \
-  --billed-cost 4.63 \
-  --source invoice_2026q2
-```
-
-Without a trusted pricing file, dollar figures stay advisory and token budgets remain the only hard stop.
-</details>
-
-<details>
-<summary>Quota burn and session tuning</summary>
-
-Unlock projected quota exhaustion:
-
-```bash
-export CLAUDITOR_WEEKLY_TOKEN_BUDGET=100000000
-docker compose up -d
-```
-
-Tune how quickly idle work splits into a new session:
-
-```bash
-CLAUDITOR_SESSION_TIMEOUT_MINUTES=15 docker compose up -d
-```
-</details>
-
 ## How it works
 
 Clauditor sits between Claude Code and Anthropic through local Envoy. Envoy forwards request and streamed response metadata to `clauditor-core`, which parses SSE, tracks sessions, writes SQLite history, serves `/watch`, and exposes `/metrics`.
@@ -240,14 +182,6 @@ Claude Code  (ANTHROPIC_BASE_URL=http://127.0.0.1:10000)
                     |
           clauditor watch / Grafana
 ```
-
-## What it will not do
-
-- **It does not store full transcripts.** Recall keeps the cleaned first prompt and a compact final summary, not every turn.
-- **It does not guarantee correctness.** "Likely completed", diagnosis labels, compaction runway, and similar signals are heuristics.
-- **It does not show perfect live dollar truth.** Cost is estimated unless you reconcile it with billed data.
-- **It does not make Claude faster by itself.** It helps you see what is happening and where time is going.
-- **It is not a hosted product.** You run the proxy and dashboards locally.
 
 ## Developing on it
 
