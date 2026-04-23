@@ -26,8 +26,8 @@ fail() { echo -e "${RED}FAIL${NC}: $1"; exit 1; }
 echo "=== Parallel sessions regression test (N=$N) ==="
 
 # Stack must be running.
-if ! curl -sf http://127.0.0.1:9091/health >/dev/null; then
-    fail "clauditor-core not healthy at http://127.0.0.1:9091 — run 'docker compose up -d' first"
+if ! curl -sf http://localhost:9091/health >/dev/null; then
+    fail "clauditor-core not healthy at http://localhost:9091 — run 'docker compose up -d' first"
 fi
 
 # Unique run marker so we only count hashes logged for requests from *this*
@@ -39,7 +39,7 @@ WORKDIR_TAG="/tmp/clauditor-parallel"
 pids=()
 for i in $(seq 1 "$N"); do
     (
-        curl -sf http://127.0.0.1:10000/v1/messages \
+        curl -sf http://localhost:10000/v1/messages \
             -H "x-api-key: test-parallel" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \

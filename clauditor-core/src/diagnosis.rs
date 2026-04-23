@@ -55,6 +55,7 @@ pub struct TurnSnapshot {
     pub tool_results_failed: u32,
     pub gap_from_prev_secs: f64,
     pub context_utilization: f64,
+    pub context_window_tokens: u64,
     pub frustration_signals: u32,
     pub requested_model: Option<String>,
     pub actual_model: Option<String>,
@@ -561,6 +562,8 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
         }
     }
 
+    let degradation_turn = if degraded { degradation_turn } else { None };
+
     DiagnosisReport {
         session_id: session_id.to_string(),
         outcome: outcome.to_string(),
@@ -650,7 +653,7 @@ fn friendly_model_name(model: &str) -> String {
 mod tests {
     use std::time::Instant;
 
-    use super::{compaction_loop_signal_ending_at, TurnSnapshot};
+    use super::{analyze_session, compaction_loop_signal_ending_at, TurnSnapshot};
 
     fn snapshot(
         turn_number: u32,
@@ -671,6 +674,7 @@ mod tests {
             tool_results_failed: 0,
             gap_from_prev_secs,
             context_utilization,
+            context_window_tokens: 200_000,
             frustration_signals: 0,
             requested_model: None,
             actual_model: None,
@@ -702,5 +706,23 @@ mod tests {
         ];
 
         assert!(compaction_loop_signal_ending_at(&turns, 2).is_none());
+    }
+
+    #[test]
+    fn heuristic_only_sessions_do_not_report_degradation_turn() {
+        let mut turns = vec![
+            snapshot(1, 130_000, 500, 0.0, 0.61),
+            snapshot(2, 131_000, 400, 5.0, 0.62),
+            snapshot(3, 132_000, 300, 5.0, 0.63),
+        ];
+        turns[0].tool_calls = vec!["Edit".to_string()];
+        turns[1].tool_calls = vec!["Write".to_string()];
+        turns[2].tool_calls = vec!["Bash".to_string()];
+
+        let report = analyze_session("session-heuristic", &turns);
+        assert!(!report.degraded);
+        assert_eq!(report.degradation_turn, None);
+        assert_eq!(report.causes.len(), 1);
+        assert_eq!(report.causes[0].cause_type, "context_bloat");
     }
 }

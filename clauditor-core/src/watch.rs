@@ -78,13 +78,15 @@ pub enum WatchEvent {
         requested: String,
         actual: String,
     },
-    /// Per-turn context-window status. `fill_percent` is (input+cache) / 200k.
-    /// `turns_to_compact` projects how many turns remain before Claude Code
-    /// auto-compacts at ~85% — `None` when there isn't enough history to
-    /// project a trajectory.
+    /// Per-turn context-window status. `fill_percent` is the share of the
+    /// resolved context window consumed by input + cache tokens. The optional
+    /// `context_window_tokens` field makes the denominator explicit for clients
+    /// and debugging.
     ContextStatus {
         session_id: String,
         fill_percent: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_window_tokens: Option<u64>,
         turns_to_compact: Option<u32>,
     },
     /// Latest quota snapshot for the orchestrator top strip. For Claude Code

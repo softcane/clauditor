@@ -1,10 +1,10 @@
 services:
   envoy:
-    image: envoyproxy/envoy:v1.37.2
+    image: envoyproxy/envoy:v1.32-latest
     volumes:
       - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
     ports:
-      - "127.0.0.1:10000:10000"
+      - "10000:10000"
     depends_on:
       clauditor-core:
         condition: service_healthy
@@ -21,7 +21,7 @@ services:
     expose:
       - "50051"
     ports:
-      - "127.0.0.1:9091:9090"
+      - "9091:9090"
     environment:
       - RUST_LOG=info
       - CLAUDITOR_SESSION_BUDGET_DOLLARS=0
@@ -36,9 +36,9 @@ services:
       retries: 5
 
   prometheus:
-    image: prom/prometheus:v3.11.2
+    image: prom/prometheus:v2.52.0
     ports:
-      - "127.0.0.1:9092:9090"
+      - "9092:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -52,9 +52,9 @@ services:
         condition: service_healthy
 
   grafana:
-    image: grafana/grafana:13.0.1
+    image: grafana/grafana:11.1.0
     ports:
-      - "127.0.0.1:3000:3000"
+      - "3000:3000"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
