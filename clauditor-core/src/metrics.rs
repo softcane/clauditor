@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::sync::LazyLock;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{LazyLock, Mutex};
 
 use prometheus::{
     gather, histogram_opts, opts, register_counter_vec, register_gauge_vec, register_histogram,
@@ -10,6 +10,9 @@ use prometheus::{
 
 pub const HISTORY_WINDOWS: [(&str, u64); 3] = [("1d", 1), ("7d", 7), ("30d", 30)];
 pub const HISTORY_MODELS: [&str; 4] = ["opus", "sonnet", "haiku", "other"];
+const LIVE_MODELS: [&str; 4] = ["opus", "sonnet", "haiku", "other"];
+const LIVE_CACHE_EVENT_TYPES: [&str; 4] = ["cold_start", "partial", "miss_ttl", "miss_thrash"];
+pub const HISTORY_CACHE_EVENT_TYPES: [&str; 2] = ["miss_ttl", "miss_thrash"];
 pub const HISTORY_CAUSE_TYPES: [&str; 8] = [
     "cache_miss_ttl",
     "context_bloat",
@@ -28,10 +31,14 @@ pub struct HistoricalWindowMetrics {
     pub estimated_spend_dollars: f64,
     pub estimated_spend_dollars_by_model: BTreeMap<&'static str, f64>,
     pub avg_estimated_session_cost_dollars_by_model: BTreeMap<&'static str, f64>,
+    pub estimated_cache_waste_dollars_by_model: BTreeMap<&'static str, f64>,
     pub cache_hit_ratio: f64,
+    pub cache_events: BTreeMap<&'static str, u64>,
     pub degraded_sessions: u64,
     pub degraded_session_ratio: f64,
     pub degraded_causes: BTreeMap<&'static str, u64>,
+    pub model_fallbacks: BTreeMap<(&'static str, &'static str), u64>,
+    pub tool_failures_by_tool: BTreeMap<String, u64>,
 }
 
 pub struct ClauditorMetrics {
@@ -56,10 +63,14 @@ pub struct ClauditorMetrics {
     history_estimated_spend_dollars: GaugeVec,
     history_estimated_spend_dollars_by_model: GaugeVec,
     history_avg_estimated_session_cost_dollars: GaugeVec,
+    history_estimated_cache_waste_dollars: GaugeVec,
     history_cache_hit_ratio: GaugeVec,
+    history_cache_events: IntGaugeVec,
     history_degraded_sessions: IntGaugeVec,
     history_degraded_session_ratio: GaugeVec,
     history_degraded_causes: IntGaugeVec,
+    history_model_fallbacks: IntGaugeVec,
+    history_tool_failures: IntGaugeVec,
     history_refresh_timestamp_seconds: IntGauge,
     turn_duration_seconds: HistogramVec,
     estimated_session_cost_dollars: HistogramVec,
@@ -211,12 +222,24 @@ impl ClauditorMetrics {
                 &["window", "model"]
             )
             .expect("register clauditor_history_avg_estimated_session_cost_dollars"),
+            history_estimated_cache_waste_dollars: register_gauge_vec!(
+                "clauditor_history_estimated_cache_waste_dollars",
+                "Historical estimated cache rebuild waste in USD by rolling window and model family.",
+                &["window", "model"]
+            )
+            .expect("register clauditor_history_estimated_cache_waste_dollars"),
             history_cache_hit_ratio: register_gauge_vec!(
                 "clauditor_history_cache_hit_ratio",
                 "Historical token-weighted cache reuse share by rolling window.",
                 &["window"]
             )
             .expect("register clauditor_history_cache_hit_ratio"),
+            history_cache_events: register_int_gauge_vec!(
+                "clauditor_history_cache_events",
+                "Historical cache event counts by rolling window and cache event type.",
+                &["window", "event_type"]
+            )
+            .expect("register clauditor_history_cache_events"),
             history_degraded_sessions: register_int_gauge_vec!(
                 "clauditor_history_degraded_sessions",
                 "Historical degraded session counts by rolling window.",
@@ -235,6 +258,18 @@ impl ClauditorMetrics {
                 &["window", "cause_type"]
             )
             .expect("register clauditor_history_degraded_causes"),
+            history_model_fallbacks: register_int_gauge_vec!(
+                "clauditor_history_model_fallbacks",
+                "Historical silent model fallback counts by rolling window.",
+                &["window", "requested", "actual"]
+            )
+            .expect("register clauditor_history_model_fallbacks"),
+            history_tool_failures: register_int_gauge_vec!(
+                "clauditor_history_tool_failures",
+                "Historical tool failure counts by rolling window and tool.",
+                &["window", "tool"]
+            )
+            .expect("register clauditor_history_tool_failures"),
             history_refresh_timestamp_seconds: register_int_gauge!(
                 "clauditor_history_refresh_timestamp_seconds",
                 "Unix timestamp of the last successful historical gauge refresh."
@@ -269,9 +304,44 @@ impl ClauditorMetrics {
 }
 
 static METRICS: LazyLock<ClauditorMetrics> = LazyLock::new(ClauditorMetrics::register);
+static HISTORY_TOOL_LABELS: LazyLock<Mutex<BTreeSet<String>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
 
 pub fn init() {
-    LazyLock::force(&METRICS);
+    let metrics = LazyLock::force(&METRICS);
+    for model in LIVE_MODELS {
+        metrics.requests_total.with_label_values(&[model]);
+        metrics.tokens_total.with_label_values(&[model, "input"]);
+        metrics.tokens_total.with_label_values(&[model, "output"]);
+        metrics
+            .tokens_total
+            .with_label_values(&[model, "cache_read"]);
+        metrics
+            .tokens_total
+            .with_label_values(&[model, "cache_create"]);
+        metrics
+            .estimated_cost_dollars_total
+            .with_label_values(&[model]);
+        metrics
+            .estimated_cache_waste_dollars_total
+            .with_label_values(&[model]);
+        metrics.turn_duration_seconds.with_label_values(&[model]);
+        metrics
+            .estimated_session_cost_dollars
+            .with_label_values(&[model]);
+        for actual in LIVE_MODELS {
+            metrics
+                .model_fallback_total
+                .with_label_values(&[model, actual]);
+        }
+        for event_type in LIVE_CACHE_EVENT_TYPES {
+            metrics
+                .cache_events_total
+                .with_label_values(&[model, event_type]);
+        }
+    }
+
+    ensure_tool_metric_labels("unknown");
 }
 
 pub fn record_request(
@@ -392,6 +462,14 @@ pub fn record_tool_failures(tool_name: &str, failures: u64) {
         .inc_by(failures);
 }
 
+pub fn ensure_tool_metric_labels(tool_name: &str) {
+    let tool = normalize_tool(tool_name);
+    METRICS.tool_calls_total.with_label_values(&[tool.as_str()]);
+    METRICS
+        .tool_failures_total
+        .with_label_values(&[tool.as_str()]);
+}
+
 pub fn set_active_sessions(count: usize) {
     METRICS.active_sessions.set(count as i64);
 }
@@ -439,11 +517,27 @@ pub fn update_historical_gauges(windows: &[HistoricalWindowMetrics], refreshed_a
                 .history_avg_estimated_session_cost_dollars
                 .with_label_values(&[window, model])
                 .set(0.0);
+            METRICS
+                .history_estimated_cache_waste_dollars
+                .with_label_values(&[window, model])
+                .set(0.0);
+            for actual in HISTORY_MODELS {
+                METRICS
+                    .history_model_fallbacks
+                    .with_label_values(&[window, model, actual])
+                    .set(0);
+            }
         }
         METRICS
             .history_cache_hit_ratio
             .with_label_values(&[window])
             .set(0.0);
+        for event_type in HISTORY_CACHE_EVENT_TYPES {
+            METRICS
+                .history_cache_events
+                .with_label_values(&[window, event_type])
+                .set(0);
+        }
         METRICS
             .history_degraded_sessions
             .with_label_values(&[window])
@@ -456,6 +550,21 @@ pub fn update_historical_gauges(windows: &[HistoricalWindowMetrics], refreshed_a
             METRICS
                 .history_degraded_causes
                 .with_label_values(&[window, cause_type])
+                .set(0);
+        }
+    }
+
+    let mut known_tools = HISTORY_TOOL_LABELS.lock().unwrap();
+    for window_metrics in windows {
+        for tool in window_metrics.tool_failures_by_tool.keys() {
+            known_tools.insert(tool.clone());
+        }
+    }
+    for window in HISTORY_WINDOWS.map(|(window, _)| window) {
+        for tool in known_tools.iter() {
+            METRICS
+                .history_tool_failures
+                .with_label_values(&[window, tool.as_str()])
                 .set(0);
         }
     }
@@ -481,10 +590,22 @@ pub fn update_historical_gauges(windows: &[HistoricalWindowMetrics], refreshed_a
                 .with_label_values(&[window_metrics.window, model])
                 .set(avg_cost.max(0.0));
         }
+        for (model, waste) in &window_metrics.estimated_cache_waste_dollars_by_model {
+            METRICS
+                .history_estimated_cache_waste_dollars
+                .with_label_values(&[window_metrics.window, model])
+                .set(waste.max(0.0));
+        }
         METRICS
             .history_cache_hit_ratio
             .with_label_values(&[window_metrics.window])
             .set(window_metrics.cache_hit_ratio.clamp(0.0, 1.0));
+        for (event_type, count) in &window_metrics.cache_events {
+            METRICS
+                .history_cache_events
+                .with_label_values(&[window_metrics.window, event_type])
+                .set(*count as i64);
+        }
         METRICS
             .history_degraded_sessions
             .with_label_values(&[window_metrics.window])
@@ -500,7 +621,20 @@ pub fn update_historical_gauges(windows: &[HistoricalWindowMetrics], refreshed_a
                 .with_label_values(&[window_metrics.window, cause_type])
                 .set(*count as i64);
         }
+        for ((requested, actual), count) in &window_metrics.model_fallbacks {
+            METRICS
+                .history_model_fallbacks
+                .with_label_values(&[window_metrics.window, requested, actual])
+                .set(*count as i64);
+        }
+        for (tool, count) in &window_metrics.tool_failures_by_tool {
+            METRICS
+                .history_tool_failures
+                .with_label_values(&[window_metrics.window, tool.as_str()])
+                .set(*count as i64);
+        }
     }
+    drop(known_tools);
 
     METRICS
         .history_refresh_timestamp_seconds
@@ -578,6 +712,17 @@ pub fn historical_cause_label(cause_type: &str) -> Option<&'static str> {
 
 pub fn historical_model_label(model: &str) -> &'static str {
     normalize_model(model)
+}
+
+pub fn historical_cache_event_label(event_type: &str) -> Option<&'static str> {
+    HISTORY_CACHE_EVENT_TYPES
+        .iter()
+        .copied()
+        .find(|event| *event == event_type)
+}
+
+pub fn historical_tool_label(tool_name: &str) -> String {
+    normalize_tool(tool_name)
 }
 
 fn normalize_tool(tool_name: &str) -> String {

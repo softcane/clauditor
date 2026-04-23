@@ -164,6 +164,9 @@ pub(crate) enum WatchEvent {
     ContextStatus {
         session_id: String,
         fill_percent: f64,
+        #[allow(dead_code)]
+        #[serde(default)]
+        context_window_tokens: Option<u64>,
         #[serde(default)]
         turns_to_compact: Option<u32>,
     },
@@ -626,6 +629,7 @@ fn render_event(
         WatchEvent::ContextStatus {
             session_id: _,
             fill_percent,
+            context_window_tokens: _,
             turns_to_compact,
         } => {
             // Only show context status when it actually matters — avoid

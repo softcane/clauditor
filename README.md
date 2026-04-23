@@ -6,7 +6,7 @@ Clauditor is a local, fail-open observability layer for Claude Code. In plain En
 
 I made this because once I had a few `claude` terminals open at the same time, I kept losing track of them. One would be chewing through tools, another would be idle, another would suddenly get slower, and I had no quick way to tell why. Clauditor is meant to make that less annoying.
 
-If you only run one short Claude session now and then, this is probably too much setup. If you regularly have multiple sessions open and keep wondering which one is stuck or why a turn got wierd, this is where it starts to pay off.
+If you only run one short Claude session now and then, the full stack is probably more setup than you need. If you run longer sessions, care about cost or context trends, or regularly have multiple sessions open and keep wondering which one is stuck or why a turn got weird, this is where it starts to pay off.
 
 ![Clauditor before and after](docs/before-after.png)
 
@@ -139,10 +139,17 @@ curl -s http://127.0.0.1:9091/metrics | grep '^clauditor_'
 - **Tool activity.** Reads, edits, bash commands, grep/glob calls, and tool failures.
 - **Cache intelligence.** Cache hits, misses, expiry countdown, and estimated rebuild cost.
 - **Context pressure.** Fill percentage and projected turns-to-compact as a heuristic.
+  Fill percentage is computed against the detected context window for the current request, including extended-context requests such as `sonnet[1m]` or `opus[1m]`.
 - **Model fallback.** Detection when the response model differs from the requested one.
 - **Quota burn.** Weekly token use, reset time, and projected exhaustion if you set a budget.
 - **Session diagnosis.** Post-session hints for things like cache expiry, thrash, tool failure streaks, or compaction pressure.
 - **Session history.** Recent sessions in SQLite plus lightweight recall.
+
+If your provider or gateway strips the signal Clauditor uses to detect extended context, pin the denominator explicitly:
+
+```bash
+CLAUDITOR_CONTEXT_WINDOW_TOKENS=1000000 docker compose up -d
+```
 
 ## Who this is for
 

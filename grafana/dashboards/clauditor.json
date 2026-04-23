@@ -351,7 +351,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (model) (increase(clauditor_estimated_cache_waste_dollars_total[1d])) or on() vector(0)",
+          "expr": "clauditor_history_estimated_cache_waste_dollars{window=\"1d\"}",
           "legendFormat": "{{model}}",
           "refId": "A"
         }
@@ -419,7 +419,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (requested, actual) (increase(clauditor_model_fallback_total[1d])) or on() vector(0)",
+          "expr": "clauditor_history_model_fallbacks{window=\"1d\"}",
           "legendFormat": "{{requested}} -> {{actual}}",
           "refId": "A"
         }
@@ -891,7 +891,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(increase(clauditor_cache_events_total{event_type=\"miss_ttl\"}[1d])) or vector(0)",
+          "expr": "clauditor_history_cache_events{window=\"1d\",event_type=\"miss_ttl\"}",
           "legendFormat": "",
           "refId": "A"
         }
@@ -955,7 +955,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(increase(clauditor_cache_events_total{event_type=\"miss_thrash\"}[1d])) or vector(0)",
+          "expr": "clauditor_history_cache_events{window=\"1d\",event_type=\"miss_thrash\"}",
           "legendFormat": "",
           "refId": "A"
         }
@@ -1019,7 +1019,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(increase(clauditor_tool_failures_total[1d])) or vector(0)",
+          "expr": "sum(clauditor_history_tool_failures{window=\"1d\"}) or vector(0)",
           "legendFormat": "",
           "refId": "A"
         }
@@ -1087,13 +1087,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(increase(clauditor_cache_events_total{event_type=\"miss_ttl\"}[1d])) or vector(0)",
+          "expr": "clauditor_history_cache_events{window=\"1d\",event_type=\"miss_ttl\"}",
           "legendFormat": "ttl",
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "sum(increase(clauditor_cache_events_total{event_type=\"miss_thrash\"}[1d])) or vector(0)",
+          "expr": "clauditor_history_cache_events{window=\"1d\",event_type=\"miss_thrash\"}",
           "legendFormat": "thrash",
           "refId": "B"
         }
@@ -1161,7 +1161,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (tool) (increase(clauditor_tool_failures_total[1d])) or on() vector(0)",
+          "expr": "clauditor_history_tool_failures{window=\"1d\"}",
           "legendFormat": "{{tool}}",
           "refId": "A"
         }
