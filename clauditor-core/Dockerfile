@@ -9,7 +9,7 @@ COPY src/ src/
 RUN cargo build --release
 
 # Stage 2: Runtime
-FROM debian:12.13-slim
+FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates wget && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/clauditor-core /usr/local/bin/clauditor-core
 EXPOSE 50051 9090

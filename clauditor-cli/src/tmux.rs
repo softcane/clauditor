@@ -799,6 +799,7 @@ impl TmuxOrchestrator {
             WatchEvent::ContextStatus {
                 session_id,
                 fill_percent,
+                context_window_tokens: _,
                 turns_to_compact,
             } => {
                 self.ensure_pane_exists(session_id, cleanup_pane_ids);

@@ -328,7 +328,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     total_cache_read_tokens INTEGER DEFAULT 0,
     total_cache_creation_tokens INTEGER DEFAULT 0,
     total_cost_dollars REAL DEFAULT 0.0,
-    cache_hit_ratio REAL,
     cache_waste_dollars REAL DEFAULT 0.0,
     request_count INTEGER DEFAULT 0,
     model TEXT,
@@ -379,6 +378,7 @@ CREATE TABLE IF NOT EXISTS turn_snapshots (
     tool_failures         INTEGER DEFAULT 0,
     gap_from_prev_secs    REAL,
     context_utilization   REAL,
+    context_window_tokens INTEGER,
     frustration_signals   INTEGER DEFAULT 0,
     requested_model       TEXT,
     actual_model          TEXT,
@@ -472,6 +472,7 @@ enum DbCommand {
         tool_failures: u32,
         gap_from_prev_secs: f64,
         context_utilization: f64,
+        context_window_tokens: u64,
         frustration_signals: u32,
         requested_model: Option<String>,
         actual_model: Option<String>,
@@ -551,6 +552,12 @@ fn ensure_turn_snapshot_model_columns(conn: &Connection) -> rusqlite::Result<()>
             [],
         )?;
     }
+    if !columns.contains("context_window_tokens") {
+        conn.execute(
+            "ALTER TABLE turn_snapshots ADD COLUMN context_window_tokens INTEGER",
+            [],
+        )?;
+    }
 
     Ok(())
 }
@@ -564,6 +571,9 @@ fn ensure_session_columns(conn: &Connection) -> rusqlite::Result<()> {
 
     if !columns.contains("initial_prompt") {
         conn.execute("ALTER TABLE sessions ADD COLUMN initial_prompt TEXT", [])?;
+    }
+    if columns.contains("cache_hit_ratio") {
+        conn.execute("ALTER TABLE sessions DROP COLUMN cache_hit_ratio", [])?;
     }
 
     Ok(())
@@ -584,6 +594,89 @@ fn ensure_request_cost_columns(conn: &Connection) -> rusqlite::Result<()> {
             "ALTER TABLE requests ADD COLUMN trusted_for_budget_enforcement INTEGER DEFAULT 0",
             [],
         )?;
+    }
+
+    Ok(())
+}
+
+fn repair_turn_snapshot_context_windows(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT id, input_tokens, cache_read_tokens, cache_creation_tokens, \
+         requested_model, actual_model \
+         FROM turn_snapshots \
+         WHERE context_window_tokens IS NULL OR context_window_tokens <= 0",
+    )?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?.max(0) as u64,
+                row.get::<_, i64>(2)?.max(0) as u64,
+                row.get::<_, i64>(3)?.max(0) as u64,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .filter_map(|row| row.ok())
+        .collect::<Vec<_>>();
+
+    for (
+        id,
+        input_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        requested_model,
+        actual_model,
+    ) in rows
+    {
+        let context_window_tokens = infer_context_window_tokens(
+            requested_model.as_deref(),
+            actual_model.as_deref(),
+            input_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+        );
+        let context_utilization = context_fill_ratio(
+            input_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            context_window_tokens,
+        );
+        conn.execute(
+            "UPDATE turn_snapshots \
+             SET context_window_tokens = ?2, context_utilization = ?3 \
+             WHERE id = ?1",
+            rusqlite::params![id, context_window_tokens as i64, context_utilization],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn repair_session_diagnosis_degradation_turns(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE session_diagnoses SET degradation_turn = NULL WHERE degraded = 0",
+        [],
+    )?;
+    Ok(())
+}
+
+fn seed_live_metric_labels_from_db(conn: &Connection) -> rusqlite::Result<()> {
+    metrics::ensure_tool_metric_labels("unknown");
+
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT tool_name FROM tool_calls \
+         UNION \
+         SELECT DISTINCT tool_name FROM tool_outcomes",
+    )?;
+    let tool_names = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(|row| row.ok())
+        .collect::<Vec<_>>();
+
+    for tool_name in tool_names {
+        metrics::ensure_tool_metric_labels(&tool_name);
     }
 
     Ok(())
@@ -612,6 +705,18 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
     }
     if let Err(e) = ensure_request_cost_columns(&conn) {
         eprintln!("Failed to migrate requests cost columns: {e}");
+        return;
+    }
+    if let Err(e) = repair_turn_snapshot_context_windows(&conn) {
+        eprintln!("Failed to repair turn_snapshots context windows: {e}");
+        return;
+    }
+    if let Err(e) = repair_session_diagnosis_degradation_turns(&conn) {
+        eprintln!("Failed to repair session_diagnoses degradation turns: {e}");
+        return;
+    }
+    if let Err(e) = seed_live_metric_labels_from_db(&conn) {
+        eprintln!("Failed to seed live metric labels from SQLite: {e}");
         return;
     }
 
@@ -715,6 +820,7 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 tool_failures,
                 gap_from_prev_secs,
                 context_utilization,
+                context_window_tokens,
                 frustration_signals,
                 requested_model,
                 actual_model,
@@ -724,8 +830,9 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                     "INSERT INTO turn_snapshots (session_id, turn_number, timestamp, \
                      input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, \
                      ttft_ms, tool_calls, tool_failures, gap_from_prev_secs, \
-                     context_utilization, frustration_signals, requested_model, actual_model, response_summary) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                     context_utilization, context_window_tokens, frustration_signals, \
+                     requested_model, actual_model, response_summary) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                     rusqlite::params![
                         session_id,
                         turn_number,
@@ -739,6 +846,7 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                         tool_failures,
                         gap_from_prev_secs,
                         context_utilization,
+                        context_window_tokens,
                         frustration_signals,
                         requested_model,
                         actual_model,
@@ -1228,7 +1336,7 @@ fn build_diagnosis_response_json(
         "billing_imported_at": billing_imported_at,
         "cache_hit_ratio": cache_hit_ratio,
         "degraded": degraded,
-        "degradation_turn": degradation_turn,
+        "degradation_turn": if degraded { degradation_turn } else { None },
         "causes": causes,
         "advice": advice,
     })
@@ -1288,7 +1396,7 @@ fn query_historical_window_from_db(
 ) -> rusqlite::Result<metrics::HistoricalWindowMetrics> {
     let mut stmt = conn.prepare(
         "SELECT model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, \
-         cost_dollars, cost_source, trusted_for_budget_enforcement \
+         cost_dollars, cost_source, trusted_for_budget_enforcement, cache_event \
          FROM requests WHERE timestamp >= ?1",
     )?;
     let rows = stmt.query_map(rusqlite::params![since], |row| {
@@ -1301,13 +1409,16 @@ fn query_historical_window_from_db(
             row.get::<_, Option<f64>>(5)?,
             row.get::<_, Option<String>>(6)?,
             row.get::<_, Option<i64>>(7)?,
+            row.get::<_, Option<String>>(8)?,
         ))
     })?;
 
     let mut cost_accumulator = CostAccumulator::new();
     let mut estimated_spend_dollars_by_model = std::collections::BTreeMap::new();
+    let mut estimated_cache_waste_dollars_by_model = std::collections::BTreeMap::new();
     let mut cache_read_tokens: i64 = 0;
     let mut cache_total_tokens: i64 = 0;
+    let mut cache_events = std::collections::BTreeMap::new();
     for row in rows {
         let (
             model,
@@ -1318,6 +1429,7 @@ fn query_historical_window_from_db(
             stored_cost,
             stored_source,
             stored_trusted,
+            cache_event,
         ) = row?;
         let row_cost = if let Some(cost) = stored_cost {
             cost_accumulator.record_persisted(cost, stored_source, stored_trusted.map(|n| n != 0));
@@ -1335,6 +1447,18 @@ fn query_historical_window_from_db(
             total_cost
         };
         let model_label = metrics::historical_model_label(&model);
+        if let Some(cache_event_label) = cache_event
+            .as_deref()
+            .and_then(metrics::historical_cache_event_label)
+        {
+            *cache_events.entry(cache_event_label).or_insert(0) += 1;
+            let waste =
+                pricing::estimate_cache_rebuild_waste_dollars(&model, cache_create.max(0) as u64)
+                    .total_cost_dollars;
+            *estimated_cache_waste_dollars_by_model
+                .entry(model_label)
+                .or_insert(0.0) += waste.max(0.0);
+        }
         *estimated_spend_dollars_by_model
             .entry(model_label)
             .or_insert(0.0) += row_cost.max(0.0);
@@ -1384,6 +1508,50 @@ fn query_historical_window_from_db(
         0.0
     };
 
+    let mut model_fallbacks = std::collections::BTreeMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT requested_model, actual_model \
+         FROM turn_snapshots WHERE timestamp >= ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![since], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+        ))
+    })?;
+    for row in rows {
+        let (requested_model, actual_model) = row?;
+        let Some(requested_model) = requested_model else {
+            continue;
+        };
+        let Some(actual_model) = actual_model else {
+            continue;
+        };
+        let requested_label = metrics::historical_model_label(&requested_model);
+        let actual_label = metrics::historical_model_label(&actual_model);
+        if requested_label != actual_label {
+            *model_fallbacks
+                .entry((requested_label, actual_label))
+                .or_insert(0) += 1;
+        }
+    }
+
+    let mut tool_failures_by_tool = std::collections::BTreeMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT tool_name, COUNT(*) \
+         FROM tool_outcomes \
+         WHERE timestamp >= ?1 AND outcome = 'error' \
+         GROUP BY tool_name",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![since], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (tool_name, count) = row?;
+        let tool_label = metrics::historical_tool_label(&tool_name);
+        *tool_failures_by_tool.entry(tool_label).or_insert(0) += count.max(0) as u64;
+    }
+
     let mut avg_estimated_session_cost_dollars_by_model = std::collections::BTreeMap::new();
     let mut model_totals = std::collections::BTreeMap::<&'static str, (f64, u64)>::new();
     let mut stmt = conn.prepare(
@@ -1422,11 +1590,15 @@ fn query_historical_window_from_db(
         sessions,
         estimated_spend_dollars: cost_accumulator.finish().estimated_cost_dollars,
         estimated_spend_dollars_by_model,
+        estimated_cache_waste_dollars_by_model,
         avg_estimated_session_cost_dollars_by_model,
         cache_hit_ratio,
+        cache_events,
         degraded_sessions,
         degraded_session_ratio,
         degraded_causes,
+        model_fallbacks,
+        tool_failures_by_tool,
     })
 }
 
@@ -1751,12 +1923,18 @@ impl ResponseAccumulator {
 /// Relaxed model equivalence check: "claude-opus-4-7" and
 /// "claude-opus-4-7-20260410" should be considered the same model. We treat
 /// two strings as matching if either contains the other as a prefix.
+fn normalize_model_for_match(model: &str) -> &str {
+    model.strip_suffix("[1m]").unwrap_or(model)
+}
+
 pub(crate) fn model_matches(requested: &str, actual: &str) -> bool {
+    let requested = normalize_model_for_match(requested);
+    let actual = normalize_model_for_match(actual);
     requested == actual || requested.starts_with(actual) || actual.starts_with(requested)
 }
 
 /// Linear extrapolation: estimate how many turns remain before Claude Code
-/// auto-compacts at ~85% of a 200K context window.
+/// auto-compacts at ~85% of the resolved context window.
 pub(crate) fn project_turns_until_compaction(
     prev_fill_percent: f64,
     current_fill_percent: f64,
@@ -1779,11 +1957,12 @@ pub(crate) fn project_turns_until_compaction(
 fn project_turns_to_compact(session_id: &str, current_fill_percent: f64) -> Option<u32> {
     let turns = diagnosis::SESSION_TURNS.get(session_id)?;
     let prev = turns.last()?;
-    let prev_fill = (prev.input_tokens as u64
-        + prev.cache_read_tokens as u64
-        + prev.cache_creation_tokens as u64) as f64
-        / 200_000.0
-        * 100.0;
+    let prev_fill = context_fill_percent(
+        prev.input_tokens as u64,
+        prev.cache_read_tokens as u64,
+        prev.cache_creation_tokens as u64,
+        prev.context_window_tokens,
+    );
     project_turns_until_compaction(prev_fill, current_fill_percent)
 }
 
@@ -1796,6 +1975,7 @@ fn finalize_response(
     sys_prompt_hash: u64,
     working_dir_str: &str,
     user_prompt_excerpt: &str,
+    context_window_tokens: u64,
 ) {
     let duration = started_at.elapsed();
     let duration_secs = duration.as_secs_f64();
@@ -2012,17 +2192,21 @@ fn finalize_response(
         }
 
         // Compaction runway: broadcast current context fill + projected turns
-        // until Claude Code auto-compacts (~85% of a 200K window). If we have
-        // <2 turns of history we don't project — the slope is meaningless.
-        let fill_percent = (acc.input_tokens + acc.cache_read_tokens + acc.cache_creation_tokens)
-            as f64
-            / 200_000.0
-            * 100.0;
+        // until Claude Code auto-compacts (~85% of the resolved context
+        // window). If we have <2 turns of history we don't project — the
+        // slope is meaningless.
+        let fill_percent = context_fill_percent(
+            acc.input_tokens,
+            acc.cache_read_tokens,
+            acc.cache_creation_tokens,
+            context_window_tokens,
+        );
         let turns_to_compact = project_turns_to_compact(&session_id, fill_percent);
         metrics::record_context_status(turns_to_compact);
         watch::BROADCASTER.broadcast(watch::WatchEvent::ContextStatus {
             session_id: session_id.clone(),
             fill_percent,
+            context_window_tokens: Some(context_window_tokens),
             turns_to_compact,
         });
 
@@ -2049,10 +2233,13 @@ fn finalize_response(
                 tool_calls: acc.tool_calls.clone(),
                 tool_results_failed: tool_failures,
                 gap_from_prev_secs: gap,
-                context_utilization: (acc.input_tokens
-                    + acc.cache_read_tokens
-                    + acc.cache_creation_tokens) as f64
-                    / 200_000.0,
+                context_utilization: context_fill_ratio(
+                    acc.input_tokens,
+                    acc.cache_read_tokens,
+                    acc.cache_creation_tokens,
+                    context_window_tokens,
+                ),
+                context_window_tokens,
                 frustration_signals: acc.frustration_signal_count,
                 requested_model: Some(model.to_string()),
                 actual_model: acc.response_model.clone(),
@@ -2095,9 +2282,12 @@ fn finalize_response(
                 .map(|t| t.gap_from_prev_secs)
                 .unwrap_or(0.0)
         };
-        let snap_ctx = (acc.input_tokens + acc.cache_read_tokens + acc.cache_creation_tokens)
-            as f64
-            / 200_000.0;
+        let snap_ctx = context_fill_ratio(
+            acc.input_tokens,
+            acc.cache_read_tokens,
+            acc.cache_creation_tokens,
+            context_window_tokens,
+        );
         let snap_frust = acc.frustration_signal_count;
         let snap_requested_model = Some(model.to_string());
         let snap_actual_model = acc.response_model.clone();
@@ -2115,6 +2305,7 @@ fn finalize_response(
             tool_failures: snap_failures,
             gap_from_prev_secs: snap_gap,
             context_utilization: snap_ctx,
+            context_window_tokens,
             frustration_signals: snap_frust,
             requested_model: snap_requested_model,
             actual_model: snap_actual_model,
@@ -2174,6 +2365,16 @@ fn finalize_response(
             output_tokens = acc.output_tokens,
             cache_read = acc.cache_read_tokens,
             cache_create = acc.cache_creation_tokens,
+            context_window_tokens,
+            fill_percent = format!(
+                "{:.1}",
+                context_fill_percent(
+                    acc.input_tokens,
+                    acc.cache_read_tokens,
+                    acc.cache_creation_tokens,
+                    context_window_tokens
+                )
+            ),
             estimated_cost = format!("${:.6}", total_cost),
             duration_s = format!("{:.2}", duration_secs),
             tools = acc.tool_calls.len(),
@@ -2209,29 +2410,53 @@ fn load_turn_snapshots_from_db(
     let mut stmt = conn.prepare(
         "SELECT turn_number, input_tokens, cache_read_tokens, cache_creation_tokens, \
          output_tokens, ttft_ms, tool_calls, tool_failures, gap_from_prev_secs, \
-         context_utilization, frustration_signals, requested_model, actual_model, response_summary \
+         context_utilization, context_window_tokens, frustration_signals, requested_model, actual_model, response_summary \
          FROM turn_snapshots WHERE session_id = ?1 ORDER BY turn_number ASC",
     )?;
 
     let turns = stmt
         .query_map(rusqlite::params![session_id], |row| {
             let tool_calls_raw = row.get::<_, String>(6)?;
-            let response_summary = row.get::<_, Option<String>>(13)?;
+            let input_tokens = row.get::<_, i64>(1)?.max(0) as u32;
+            let cache_read_tokens = row.get::<_, i64>(2)?.max(0) as u32;
+            let cache_creation_tokens = row.get::<_, i64>(3)?.max(0) as u32;
+            let requested_model = row.get::<_, Option<String>>(12)?;
+            let actual_model = row.get::<_, Option<String>>(13)?;
+            let context_window_tokens = row
+                .get::<_, Option<i64>>(10)?
+                .map(|value| value.max(0) as u64)
+                .filter(|value| *value > 0)
+                .unwrap_or_else(|| {
+                    infer_context_window_tokens(
+                        requested_model.as_deref(),
+                        actual_model.as_deref(),
+                        input_tokens as u64,
+                        cache_read_tokens as u64,
+                        cache_creation_tokens as u64,
+                    )
+                });
+            let response_summary = row.get::<_, Option<String>>(14)?;
             Ok(diagnosis::TurnSnapshot {
                 turn_number: row.get::<_, i64>(0)?.max(0) as u32,
                 timestamp: Instant::now(),
-                input_tokens: row.get::<_, i64>(1)?.max(0) as u32,
-                cache_read_tokens: row.get::<_, i64>(2)?.max(0) as u32,
-                cache_creation_tokens: row.get::<_, i64>(3)?.max(0) as u32,
+                input_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
                 output_tokens: row.get::<_, i64>(4)?.max(0) as u32,
                 ttft_ms: row.get::<_, i64>(5)?.max(0) as u64,
                 tool_calls: parse_tool_calls_json(&tool_calls_raw),
                 tool_results_failed: row.get::<_, i64>(7)?.max(0) as u32,
                 gap_from_prev_secs: row.get::<_, f64>(8)?.max(0.0),
-                context_utilization: row.get::<_, f64>(9)?.max(0.0),
-                frustration_signals: row.get::<_, i64>(10)?.max(0) as u32,
-                requested_model: row.get::<_, Option<String>>(11)?,
-                actual_model: row.get::<_, Option<String>>(12)?,
+                context_utilization: context_fill_ratio(
+                    input_tokens as u64,
+                    cache_read_tokens as u64,
+                    cache_creation_tokens as u64,
+                    context_window_tokens,
+                ),
+                context_window_tokens,
+                frustration_signals: row.get::<_, i64>(11)?.max(0) as u32,
+                requested_model,
+                actual_model,
                 response_summary: response_summary.filter(|s| !s.trim().is_empty()),
             })
         })?
@@ -2313,6 +2538,8 @@ fn repair_persisted_session_artifacts(conn: &Connection) -> rusqlite::Result<()>
     let _ = ensure_turn_snapshot_model_columns(conn);
     let _ = ensure_session_columns(conn);
     let _ = ensure_request_cost_columns(conn);
+    let _ = repair_turn_snapshot_context_windows(conn);
+    let _ = repair_session_diagnosis_degradation_turns(conn);
     let cutoff = epoch_to_iso8601(now_epoch_secs().saturating_sub(session_timeout_secs()));
     let mut stmt = conn.prepare(
         "SELECT s.session_id, s.ended_at, s.initial_prompt, d.outcome, \
@@ -2530,6 +2757,107 @@ fn extract_header(h: &HttpHeaders, name: &str) -> Option<String> {
                 hv.value.clone()
             }
         })
+}
+
+fn extract_headers(h: &HttpHeaders, name: &str) -> Vec<String> {
+    h.headers
+        .as_ref()
+        .map(|headers| {
+            headers
+                .headers
+                .iter()
+                .filter(|hv| hv.key.eq_ignore_ascii_case(name))
+                .map(|hv| {
+                    if hv.value.is_empty() {
+                        String::from_utf8_lossy(&hv.raw_value).into_owned()
+                    } else {
+                        hv.value.clone()
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+const STANDARD_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+const EXTENDED_CONTEXT_WINDOW_TOKENS: u64 = 1_000_000;
+const CONTEXT_1M_BETA_PREFIX: &str = "context-1m-";
+
+fn configured_context_window_tokens() -> Option<u64> {
+    let value = std::env::var("CLAUDITOR_CONTEXT_WINDOW_TOKENS").ok()?;
+    let parsed = value.parse::<u64>().ok()?;
+    if parsed == 0 {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+fn model_requests_1m_context(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("[1m]")
+}
+
+fn request_uses_1m_context(headers: &HttpHeaders) -> bool {
+    extract_headers(headers, "anthropic-beta")
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(|beta| beta.trim().to_ascii_lowercase())
+        .any(|beta| beta.starts_with(CONTEXT_1M_BETA_PREFIX))
+}
+
+fn resolve_context_window_tokens(header_hint: Option<u64>, model: &str) -> u64 {
+    configured_context_window_tokens()
+        .or_else(|| header_hint)
+        .or_else(|| model_requests_1m_context(model).then_some(EXTENDED_CONTEXT_WINDOW_TOKENS))
+        .unwrap_or(STANDARD_CONTEXT_WINDOW_TOKENS)
+}
+
+fn infer_context_window_tokens(
+    requested_model: Option<&str>,
+    actual_model: Option<&str>,
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+) -> u64 {
+    if let Some(configured) = configured_context_window_tokens() {
+        return configured;
+    }
+
+    let model = actual_model.or(requested_model).unwrap_or("");
+    if model_requests_1m_context(model) {
+        return EXTENDED_CONTEXT_WINDOW_TOKENS;
+    }
+
+    let total_input_tokens = input_tokens + cache_read_tokens + cache_creation_tokens;
+    if total_input_tokens > STANDARD_CONTEXT_WINDOW_TOKENS {
+        return EXTENDED_CONTEXT_WINDOW_TOKENS;
+    }
+
+    STANDARD_CONTEXT_WINDOW_TOKENS
+}
+
+fn context_fill_ratio(
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+    context_window_tokens: u64,
+) -> f64 {
+    let total = input_tokens + cache_read_tokens + cache_creation_tokens;
+    total as f64 / context_window_tokens.max(1) as f64
+}
+
+fn context_fill_percent(
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+    context_window_tokens: u64,
+) -> f64 {
+    context_fill_ratio(
+        input_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        context_window_tokens,
+    ) * 100.0
 }
 
 /// Local quota-burn tracker. Anthropic does not expose rate-limit headers to
@@ -3113,6 +3441,8 @@ impl ExternalProcessor for ClauditorProcessor {
             let mut sys_prompt_hash: u64 = 0;
             let mut working_dir_str = String::new();
             let mut user_prompt_excerpt_buf = String::new();
+            let mut request_context_window_hint: Option<u64> = None;
+            let mut context_window_tokens = STANDARD_CONTEXT_WINDOW_TOKENS;
             let mut finalized = false;
 
             loop {
@@ -3130,6 +3460,7 @@ impl ExternalProcessor for ClauditorProcessor {
                                 sys_prompt_hash,
                                 &working_dir_str,
                                 &user_prompt_excerpt_buf,
+                                context_window_tokens,
                             );
                             REQUEST_STATE.remove(&request_id);
                         }
@@ -3147,6 +3478,7 @@ impl ExternalProcessor for ClauditorProcessor {
                                 sys_prompt_hash,
                                 &working_dir_str,
                                 &user_prompt_excerpt_buf,
+                                context_window_tokens,
                             );
                             REQUEST_STATE.remove(&request_id);
                         }
@@ -3159,6 +3491,10 @@ impl ExternalProcessor for ClauditorProcessor {
                         started_at = Instant::now();
                         request_id = extract_header(h, "x-request-id")
                             .unwrap_or_else(|| format!("req_{}", started_at.elapsed().as_nanos()));
+                        request_context_window_hint =
+                            request_uses_1m_context(h).then_some(EXTENDED_CONTEXT_WINDOW_TOKENS);
+                        context_window_tokens = configured_context_window_tokens()
+                            .unwrap_or(STANDARD_CONTEXT_WINDOW_TOKENS);
 
                         // Phase 7: process-wide circuit breaker.
                         if let Some((err_type, msg)) = check_circuit_breaker() {
@@ -3218,6 +3554,10 @@ impl ExternalProcessor for ClauditorProcessor {
                                 // passing the excerpt every time is harmless and first-write-wins.
                                 user_prompt_excerpt_buf = user_prompt_excerpt;
                                 if !blocked {
+                                    context_window_tokens = resolve_context_window_tokens(
+                                        request_context_window_hint,
+                                        &m,
+                                    );
                                     // Session ID resolved later in finalize_response.
                                     REQUEST_STATE.insert(
                                         request_id.clone(),
@@ -3345,6 +3685,7 @@ impl ExternalProcessor for ClauditorProcessor {
                                     sys_prompt_hash,
                                     &working_dir_str,
                                     &user_prompt_excerpt_buf,
+                                    context_window_tokens,
                                 );
                             }
                             REQUEST_STATE.remove(&request_id);
@@ -4151,12 +4492,13 @@ fn load_degradation_view_from_db(conn: &Connection, session_id: &str) -> Option<
         .ok();
 
     let (degraded, degradation_turn) = diag.unwrap_or((false, None));
+    let degradation_turn = if degraded { degradation_turn } else { None };
 
     let mut stmt = conn
         .prepare(
             "SELECT turn_number, input_tokens, cache_read_tokens, cache_creation_tokens, \
-             output_tokens, ttft_ms, gap_from_prev_secs, context_utilization, tool_failures, \
-             requested_model, actual_model \
+             output_tokens, ttft_ms, gap_from_prev_secs, context_utilization, \
+             context_window_tokens, tool_failures, requested_model, actual_model \
              FROM turn_snapshots WHERE session_id = ?1 ORDER BY turn_number",
         )
         .ok()?;
@@ -4170,6 +4512,7 @@ fn load_degradation_view_from_db(conn: &Connection, session_id: &str) -> Option<
         ttft_ms: i64,
         gap: f64,
         ctx: f64,
+        context_window_tokens: i64,
         failures: i64,
         requested_model: Option<String>,
         actual_model: Option<String>,
@@ -4177,18 +4520,42 @@ fn load_degradation_view_from_db(conn: &Connection, session_id: &str) -> Option<
 
     let turns: Vec<TurnRow> = stmt
         .query_map(rusqlite::params![session_id], |row| {
+            let input = row.get::<_, i64>(1)?.max(0);
+            let cache_read = row.get::<_, i64>(2)?.max(0);
+            let cache_create = row.get::<_, i64>(3)?.max(0);
+            let requested_model = row.get::<_, Option<String>>(10)?;
+            let actual_model = row.get::<_, Option<String>>(11)?;
+            let context_window_tokens = row
+                .get::<_, Option<i64>>(8)?
+                .map(|value| value.max(0))
+                .filter(|value| *value > 0)
+                .unwrap_or_else(|| {
+                    infer_context_window_tokens(
+                        requested_model.as_deref(),
+                        actual_model.as_deref(),
+                        input.max(0) as u64,
+                        cache_read.max(0) as u64,
+                        cache_create.max(0) as u64,
+                    ) as i64
+                });
             Ok(TurnRow {
                 turn: row.get(0)?,
-                input: row.get(1)?,
-                cache_read: row.get(2)?,
-                cache_create: row.get(3)?,
+                input,
+                cache_read,
+                cache_create,
                 output: row.get(4)?,
                 ttft_ms: row.get(5)?,
                 gap: row.get(6)?,
-                ctx: row.get(7)?,
-                failures: row.get(8)?,
-                requested_model: row.get(9)?,
-                actual_model: row.get(10)?,
+                ctx: context_fill_ratio(
+                    input.max(0) as u64,
+                    cache_read.max(0) as u64,
+                    cache_create.max(0) as u64,
+                    context_window_tokens.max(1) as u64,
+                ),
+                context_window_tokens,
+                failures: row.get(9)?,
+                requested_model,
+                actual_model,
             })
         })
         .ok()?
@@ -4247,6 +4614,7 @@ fn load_degradation_view_from_db(conn: &Connection, session_id: &str) -> Option<
                 "turn_duration_ms": t.ttft_ms,
                 "gap_from_prev_secs": t.gap,
                 "context_utilization": (t.ctx * 1000.0).round() / 1000.0,
+                "context_window_tokens": t.context_window_tokens,
                 "tool_failures": t.failures,
                 "requested_model": t.requested_model.clone(),
                 "actual_model": t.actual_model.clone(),
@@ -4638,12 +5006,16 @@ mod tests {
 
     use super::{
         build_diagnosis_response_json, build_session_summary_json, build_sessions_response_json,
-        build_summary_response_json, compact_response_summary, db_writer_loop, epoch_to_iso8601,
-        load_degradation_view_from_db, metrics, now_epoch_secs, parse_latest_tool_results,
-        persist_billing_reconciliation, pricing, query_historical_metrics, query_summary,
-        repair_persisted_session_artifacts, session_timeout_secs, should_broadcast_quota_snapshot,
-        BillingReconciliationInput, BillingReconciliationWriteError, DbCommand, ParsedToolResult,
-        SummaryWindowData, ESTIMATED_COST_SOURCE, QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA,
+        build_summary_response_json, compact_response_summary, db_writer_loop,
+        ensure_session_columns, epoch_to_iso8601, load_degradation_view_from_db, metrics,
+        now_epoch_secs, parse_latest_tool_results, persist_billing_reconciliation, pricing,
+        query_historical_metrics, query_summary, repair_persisted_session_artifacts,
+        repair_turn_snapshot_context_windows, request_uses_1m_context,
+        resolve_context_window_tokens, seed_live_metric_labels_from_db, session_timeout_secs,
+        should_broadcast_quota_snapshot, BillingReconciliationInput,
+        BillingReconciliationWriteError, DbCommand, HttpHeaders, ParsedToolResult,
+        ProtoHeaderValue, SummaryWindowData, ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS,
+        QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA, STANDARD_CONTEXT_WINDOW_TOKENS,
     };
 
     static METRICS_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -4686,6 +5058,36 @@ mod tests {
                 causes_json TEXT,
                 advice_json TEXT
             );
+            CREATE TABLE turn_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                turn_number INTEGER NOT NULL,
+                timestamp TEXT NOT NULL,
+                input_tokens INTEGER,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_creation_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER,
+                ttft_ms INTEGER,
+                tool_calls TEXT,
+                tool_failures INTEGER DEFAULT 0,
+                gap_from_prev_secs REAL,
+                context_utilization REAL,
+                context_window_tokens INTEGER,
+                frustration_signals INTEGER DEFAULT 0,
+                requested_model TEXT,
+                actual_model TEXT,
+                response_summary TEXT
+            );
+            CREATE TABLE tool_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                turn_number INTEGER NOT NULL,
+                timestamp TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                input_summary TEXT,
+                outcome TEXT,
+                duration_ms INTEGER
+            );
             CREATE TABLE billing_reconciliations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -4702,6 +5104,41 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open sqlite");
         conn.execute_batch(SCHEMA).expect("create full test schema");
         conn
+    }
+
+    #[test]
+    fn ensure_session_columns_drops_legacy_cache_hit_ratio() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                total_input_tokens INTEGER DEFAULT 0,
+                total_output_tokens INTEGER DEFAULT 0,
+                total_cache_read_tokens INTEGER DEFAULT 0,
+                total_cache_creation_tokens INTEGER DEFAULT 0,
+                total_cost_dollars REAL DEFAULT 0.0,
+                cache_hit_ratio REAL,
+                cache_waste_dollars REAL DEFAULT 0.0,
+                request_count INTEGER DEFAULT 0,
+                model TEXT
+            );",
+        )
+        .expect("create legacy sessions table");
+
+        ensure_session_columns(&conn).expect("migrate sessions columns");
+
+        let columns = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .expect("prepare pragma")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query pragma")
+            .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+
+        assert!(columns.contains(&"initial_prompt".to_string()));
+        assert!(!columns.contains(&"cache_hit_ratio".to_string()));
     }
 
     fn unique_test_db_path(label: &str) -> String {
@@ -4838,6 +5275,23 @@ mod tests {
             ],
         )
         .expect("insert turn snapshot");
+    }
+
+    fn make_http_headers(entries: &[(&str, &str)]) -> HttpHeaders {
+        HttpHeaders {
+            headers: Some(super::envoy::config::core::v3::HeaderMap {
+                headers: entries
+                    .iter()
+                    .map(|(key, value)| ProtoHeaderValue {
+                        key: (*key).to_string(),
+                        value: (*value).to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 
     fn history_window<'a>(
@@ -5174,10 +5628,16 @@ mod tests {
                 avg_estimated_session_cost_dollars_by_model: std::collections::BTreeMap::from([(
                     "sonnet", 2.5,
                 )]),
+                estimated_cache_waste_dollars_by_model: std::collections::BTreeMap::from([(
+                    "sonnet", 0.75,
+                )]),
                 cache_hit_ratio: 0.42,
+                cache_events: std::collections::BTreeMap::from([("miss_thrash", 2)]),
                 degraded_sessions: 2,
                 degraded_session_ratio: 0.4,
                 degraded_causes: causes,
+                model_fallbacks: std::collections::BTreeMap::from([(("opus", "sonnet"), 1)]),
+                tool_failures_by_tool: std::collections::BTreeMap::from([("bash".to_string(), 4)]),
             }],
             1_776_700_000,
         );
@@ -5191,9 +5651,73 @@ mod tests {
         assert!(body.contains("clauditor_history_degraded_sessions"));
         assert!(body.contains("clauditor_history_degraded_session_ratio"));
         assert!(body.contains("clauditor_history_degraded_causes"));
+        assert!(body.contains("clauditor_history_estimated_cache_waste_dollars"));
+        assert!(body.contains("clauditor_history_cache_events"));
+        assert!(body.contains("clauditor_history_model_fallbacks"));
+        assert!(body.contains("clauditor_history_tool_failures"));
         assert!(body.contains("clauditor_history_refresh_timestamp_seconds 1776700000"));
         assert!(body.contains("window=\"7d\""));
         assert!(body.contains("cause_type=\"context_bloat\""));
+        assert!(body.contains("event_type=\"miss_thrash\""));
+        assert!(body.contains("requested=\"opus\""));
+        assert!(body.contains("actual=\"sonnet\""));
+        assert!(body.contains("tool=\"bash\""));
+        assert!(body
+            .contains("clauditor_cache_events_total{event_type=\"miss_thrash\",model=\"sonnet\"}"));
+        assert!(body.contains("clauditor_estimated_cache_waste_dollars_total{model=\"sonnet\"}"));
+        assert!(
+            body.contains("clauditor_model_fallback_total{actual=\"sonnet\",requested=\"opus\"} 0")
+        );
+        assert!(body.contains("clauditor_tool_failures_total{tool=\"unknown\"} 0"));
+    }
+
+    #[test]
+    fn seed_live_metric_labels_from_db_precreates_known_tool_series() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        metrics::init();
+
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(SCHEMA).expect("create schema");
+        conn.execute(
+            "INSERT INTO sessions (session_id, started_at, model) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["session_1", "2026-01-01T00:00:00Z", "claude-sonnet-4-6"],
+        )
+        .expect("insert session");
+        conn.execute(
+            "INSERT INTO requests (request_id, session_id, timestamp, model) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "req_1",
+                "session_1",
+                "2026-01-01T00:00:00Z",
+                "claude-sonnet-4-6"
+            ],
+        )
+        .expect("insert request");
+        conn.execute(
+            "INSERT INTO tool_calls (request_id, timestamp, tool_name) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["req_1", "2026-01-01T00:00:00Z", "Bash"],
+        )
+        .expect("insert tool call");
+        conn.execute(
+            "INSERT INTO tool_outcomes (session_id, turn_number, timestamp, tool_name, outcome) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "session_1",
+                1,
+                "2026-01-01T00:00:00Z",
+                "Read File",
+                "success"
+            ],
+        )
+        .expect("insert tool outcome");
+
+        seed_live_metric_labels_from_db(&conn).expect("seed tool labels");
+
+        let (_, body) = metrics::render().expect("render metrics");
+        assert!(body.contains("clauditor_tool_calls_total{tool=\"bash\"} 0"));
+        assert!(body.contains("clauditor_tool_failures_total{tool=\"bash\"} 0"));
+        assert!(body.contains("clauditor_tool_calls_total{tool=\"read_file\"} 0"));
+        assert!(body.contains("clauditor_tool_failures_total{tool=\"read_file\"} 0"));
     }
 
     #[test]
@@ -5214,10 +5738,16 @@ mod tests {
                 avg_estimated_session_cost_dollars_by_model: std::collections::BTreeMap::from([(
                     "sonnet", 0.5,
                 )]),
+                estimated_cache_waste_dollars_by_model: std::collections::BTreeMap::from([(
+                    "sonnet", 0.25,
+                )]),
                 cache_hit_ratio: 0.25,
+                cache_events: std::collections::BTreeMap::from([("miss_thrash", 2)]),
                 degraded_sessions: 1,
                 degraded_session_ratio: 0.5,
                 degraded_causes: causes,
+                model_fallbacks: std::collections::BTreeMap::from([(("opus", "sonnet"), 1)]),
+                tool_failures_by_tool: std::collections::BTreeMap::from([("bash".to_string(), 2)]),
             }],
             1_776_700_000,
         );
@@ -5229,10 +5759,14 @@ mod tests {
                 estimated_spend_dollars: 0.5,
                 estimated_spend_dollars_by_model: std::collections::BTreeMap::new(),
                 avg_estimated_session_cost_dollars_by_model: std::collections::BTreeMap::new(),
+                estimated_cache_waste_dollars_by_model: std::collections::BTreeMap::new(),
                 cache_hit_ratio: 0.0,
+                cache_events: std::collections::BTreeMap::new(),
                 degraded_sessions: 0,
                 degraded_session_ratio: 0.0,
                 degraded_causes: std::collections::BTreeMap::new(),
+                model_fallbacks: std::collections::BTreeMap::new(),
+                tool_failures_by_tool: std::collections::BTreeMap::new(),
             }],
             1_776_700_100,
         );
@@ -5587,6 +6121,86 @@ mod tests {
     }
 
     #[test]
+    fn request_uses_1m_context_detects_anthropic_beta_header() {
+        let headers = make_http_headers(&[(
+            "anthropic-beta",
+            "prompt-tools-2025-04-02, context-1m-2025-08-07",
+        )]);
+
+        assert!(request_uses_1m_context(&headers));
+        assert_eq!(
+            resolve_context_window_tokens(
+                Some(EXTENDED_CONTEXT_WINDOW_TOKENS),
+                "claude-sonnet-4-6"
+            ),
+            EXTENDED_CONTEXT_WINDOW_TOKENS
+        );
+    }
+
+    #[test]
+    fn resolve_context_window_tokens_accepts_model_suffix() {
+        assert_eq!(
+            resolve_context_window_tokens(None, "claude-sonnet-4-6[1m]"),
+            EXTENDED_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            resolve_context_window_tokens(None, "claude-sonnet-4-6"),
+            STANDARD_CONTEXT_WINDOW_TOKENS
+        );
+    }
+
+    #[test]
+    fn model_matches_ignores_1m_suffix() {
+        assert!(super::model_matches(
+            "claude-sonnet-4-6[1m]",
+            "claude-sonnet-4-6"
+        ));
+        assert!(super::model_matches(
+            "claude-opus-4-7",
+            "claude-opus-4-7[1m]"
+        ));
+    }
+
+    #[test]
+    fn repair_turn_snapshot_context_windows_backfills_oversized_turns_as_1m() {
+        let conn = create_full_test_db();
+        insert_session(
+            &conn,
+            "session-long",
+            "2026-04-23T06:00:00Z",
+            Some("2026-04-23T06:00:00Z"),
+            "claude-sonnet-4-6",
+            None,
+        );
+        insert_turn_snapshot(
+            &conn,
+            "session-long",
+            1,
+            "2026-04-23T06:00:00Z",
+            250_000,
+            0,
+            1000,
+            0.0,
+            1.255,
+            None,
+        );
+
+        repair_turn_snapshot_context_windows(&conn).expect("repair turn snapshots");
+
+        let (context_window_tokens, context_utilization): (i64, f64) = conn
+            .query_row(
+                "SELECT context_window_tokens, context_utilization \
+                 FROM turn_snapshots WHERE session_id = 'session-long'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load repaired row");
+
+        assert_eq!(context_window_tokens, EXTENDED_CONTEXT_WINDOW_TOKENS as i64);
+        assert!((context_utilization - 0.251).abs() < 0.0001);
+    }
+
+    #[test]
     fn degradation_view_repairs_missing_diagnosis_before_rendering() {
         let conn = create_full_test_db();
         let ended_at =
@@ -5643,6 +6257,46 @@ mod tests {
             Some(2)
         );
         assert_eq!(json.get("total_turns").and_then(|v| v.as_u64()), Some(3));
+    }
+
+    #[test]
+    fn repair_clears_degradation_turn_for_non_degraded_sessions() {
+        let conn = create_full_test_db();
+        let ended_at =
+            epoch_to_iso8601(now_epoch_secs().saturating_sub(session_timeout_secs() + 3_600));
+        insert_session(
+            &conn,
+            "session-ok",
+            &ended_at,
+            Some(&ended_at),
+            "claude-sonnet",
+            Some("ship the fix"),
+        );
+        conn.execute(
+            "INSERT INTO session_diagnoses (
+                session_id, completed_at, outcome, total_turns, total_cost, cache_hit_ratio,
+                degraded, degradation_turn, causes_json, advice_json
+            ) VALUES (?1, ?2, 'Likely Completed', 4, 1.5, 0.98, 0, 8, '[]', '[]')",
+            rusqlite::params!["session-ok", ended_at],
+        )
+        .expect("insert inconsistent diagnosis");
+
+        repair_persisted_session_artifacts(&conn).expect("repair persisted artifacts");
+
+        let stored_turn = conn
+            .query_row(
+                "SELECT degradation_turn FROM session_diagnoses WHERE session_id = 'session-ok'",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .expect("load repaired diagnosis turn");
+        assert_eq!(stored_turn, None);
+
+        let json = load_degradation_view_from_db(&conn, "session-ok")
+            .expect("degradation view after repair");
+        assert_eq!(json.get("degraded").and_then(|v| v.as_bool()), Some(false));
+        assert!(json.get("degradation_turn").is_some());
+        assert!(json.get("degradation_turn").unwrap().is_null());
     }
 
     #[test]

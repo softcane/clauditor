@@ -50,7 +50,7 @@ echo "Sending 5 test requests..."
 for i in $(seq 1 5); do
     model="claude-haiku-4-5-20241022"
     [ "$i" -eq 3 ] && model="claude-sonnet-4-6-20250514"
-    curl -sf http://127.0.0.1:10000/v1/messages \
+    curl -sf http://localhost:10000/v1/messages \
         -H "x-api-key: test-e2e" \
         -H "anthropic-version: 2023-06-01" \
         -H "content-type: application/json" \
@@ -90,7 +90,7 @@ if [ -n "$session_id" ]; then
         -s -w "\n%{http_code}" http://clauditor-core:9090/api/diagnosis/$session_id 2>&1)
     diag_code=$(echo "$diag_resp" | tail -1)
     if [ "$diag_code" = "200" ]; then
-        diag_body=$(echo "$diag_resp" | head -n -1)
+        diag_body=$(echo "$diag_resp" | sed '$d')
         echo "$diag_body" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'outcome' in d; assert 'degraded' in d" 2>/dev/null \
             && pass "/api/diagnosis/$session_id returns valid diagnosis" \
             || fail "/api/diagnosis response invalid"
@@ -132,7 +132,7 @@ docker compose stop clauditor-core 2>&1 | tail -1
 sleep 5
 envoy_running=$(docker compose ps --status running -q envoy 2>/dev/null | wc -l | tr -d ' ')
 [ "$envoy_running" -ge 1 ] || { fail "envoy stopped when clauditor-core stopped"; }
-response=$(curl -s --max-time 10 http://127.0.0.1:10000/v1/messages \
+response=$(curl -s --max-time 10 http://localhost:10000/v1/messages \
     -H "x-api-key: test-e2e" \
     -H "anthropic-version: 2023-06-01" \
     -H "content-type: application/json" \
