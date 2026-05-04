@@ -36,6 +36,7 @@ pub fn bootstrap_into_tmux(
     url: &str,
     no_cache: bool,
     no_signals: bool,
+    no_postmortem: bool,
     tmux_max_panes: usize,
 ) -> Result<(), String> {
     if std::env::var("TMUX").is_ok() {
@@ -71,6 +72,9 @@ pub fn bootstrap_into_tmux(
     }
     if no_signals {
         args.push("--no-signals".into());
+    }
+    if no_postmortem {
+        args.push("--no-postmortem".into());
     }
 
     use std::os::unix::process::CommandExt;
@@ -238,6 +242,7 @@ fn build_child_watch_command(
     watch_url: &str,
     no_cache: bool,
     no_signals: bool,
+    no_postmortem: bool,
 ) -> String {
     let mut cmd_parts = vec![
         cli_path.to_string(),
@@ -252,6 +257,9 @@ fn build_child_watch_command(
     }
     if no_signals {
         cmd_parts.push("--no-signals".to_string());
+    }
+    if no_postmortem {
+        cmd_parts.push("--no-postmortem".to_string());
     }
     shell_join(&cmd_parts)
 }
@@ -297,6 +305,7 @@ pub struct TmuxOrchestrator {
     cli_path: String,
     no_cache: bool,
     no_signals: bool,
+    no_postmortem: bool,
     max_panes: usize,
     rate_limit: Option<RateLimitSummary>,
 }
@@ -306,6 +315,7 @@ impl TmuxOrchestrator {
         watch_url: String,
         no_cache: bool,
         no_signals: bool,
+        no_postmortem: bool,
         max_panes: usize,
     ) -> Result<Self, String> {
         let own_pane_id = get_own_pane_id()?;
@@ -320,6 +330,7 @@ impl TmuxOrchestrator {
             cli_path,
             no_cache,
             no_signals,
+            no_postmortem,
             max_panes,
             rate_limit: None,
         };
@@ -341,6 +352,7 @@ impl TmuxOrchestrator {
             &self.watch_url,
             self.no_cache,
             self.no_signals,
+            self.no_postmortem,
         );
 
         // Determine split strategy.
@@ -760,8 +772,10 @@ impl TmuxOrchestrator {
     fn handle_event(&mut self, event: &WatchEvent, cleanup_pane_ids: &Arc<Mutex<Vec<String>>>) {
         // Touch activity timestamp on any session-scoped event so the status
         // coloring reflects real-time pulse, not only ToolUse.
-        if let Some(sid) = event_session_id(event) {
-            self.bump_activity(sid);
+        if !matches!(event, WatchEvent::PostmortemReady { .. }) {
+            if let Some(sid) = event_session_id(event) {
+                self.bump_activity(sid);
+            }
         }
         match event {
             WatchEvent::SessionStart {
@@ -804,6 +818,10 @@ impl TmuxOrchestrator {
                 if let Some(pane) = self.panes.get_mut(session_id.as_str()) {
                     pane.ended = true;
                 }
+                self.render_status();
+            }
+
+            WatchEvent::PostmortemReady { .. } => {
                 self.render_status();
             }
 
@@ -1049,6 +1067,7 @@ mod tests {
             cli_path: "clauditor".to_string(),
             no_cache: false,
             no_signals: false,
+            no_postmortem: false,
             max_panes,
             rate_limit: None,
         }
@@ -1082,6 +1101,7 @@ mod tests {
                 "http://localhost:9091",
                 false,
                 false,
+                false,
             ),
             "clauditor watch --session session_a --url http://localhost:9091"
         );
@@ -1093,8 +1113,9 @@ mod tests {
                 "http://localhost:9091/watch?session=session with spaces",
                 true,
                 true,
+                true,
             ),
-            "'/tmp/clauditor cli' watch --session 'session with spaces' --url 'http://localhost:9091/watch?session=session with spaces' --no-cache --no-signals"
+            "'/tmp/clauditor cli' watch --session 'session with spaces' --url 'http://localhost:9091/watch?session=session with spaces' --no-cache --no-signals --no-postmortem"
         );
     }
 
@@ -1274,5 +1295,23 @@ mod tests {
         assert_eq!(rate_limit.tokens_remaining, Some(9_000));
         assert_eq!(rate_limit.budget_source.as_deref(), Some("auto_p95_4w"));
         assert_eq!(rate_limit.projected_exhaustion_secs, Some(1800));
+    }
+
+    #[test]
+    fn postmortem_ready_does_not_lazy_create_tmux_pane() {
+        let mut orchestrator = test_orchestrator(4);
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+
+        orchestrator.handle_event(
+            &WatchEvent::PostmortemReady {
+                session_id: "session_idle".to_string(),
+                idle_secs: 90,
+                total_tokens: 123,
+                total_turns: 1,
+            },
+            &cleanup,
+        );
+
+        assert!(orchestrator.panes.is_empty());
     }
 }

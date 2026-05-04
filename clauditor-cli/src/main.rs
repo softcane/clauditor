@@ -1,6 +1,6 @@
 mod tmux;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -65,6 +65,10 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
 
+        /// Do not render a redacted session postmortem when a session ends
+        #[arg(long)]
+        no_postmortem: bool,
+
         /// Split each session into its own tmux pane
         #[arg(long, conflicts_with = "session")]
         tmux: bool,
@@ -87,6 +91,24 @@ enum Commands {
         /// Days to look back
         #[arg(long, default_value = "7")]
         days: u32,
+    },
+
+    /// Generate a deterministic markdown postmortem for a session
+    Postmortem {
+        /// Base URL of clauditor-core
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+
+        /// Session id, or "last" for the latest completed session
+        target: String,
+
+        /// Redact prompts, paths, query strings, tool payloads, and secret-like values
+        #[arg(long)]
+        redact: bool,
+
+        /// Write markdown to this file instead of stdout
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 
     /// Search across past session prompts and final summaries
@@ -185,6 +207,12 @@ pub(crate) enum WatchEvent {
     SessionEnd {
         session_id: String,
         outcome: String,
+        total_tokens: u64,
+        total_turns: u32,
+    },
+    PostmortemReady {
+        session_id: String,
+        idle_secs: u64,
         total_tokens: u64,
         total_turns: u32,
     },
@@ -1197,6 +1225,7 @@ pub(crate) fn event_session_id(event: &WatchEvent) -> Option<&str> {
         | WatchEvent::CacheEvent { session_id, .. }
         | WatchEvent::SessionStart { session_id, .. }
         | WatchEvent::SessionEnd { session_id, .. }
+        | WatchEvent::PostmortemReady { session_id, .. }
         | WatchEvent::FrustrationSignal { session_id, .. }
         | WatchEvent::CompactionLoop { session_id, .. }
         | WatchEvent::Diagnosis { session_id, .. }
@@ -1246,6 +1275,22 @@ impl ActiveSessions {
             .map(|s| s.as_str())
             .unwrap_or("?");
         format!("[{:width$}]  ", name, width = max_width)
+    }
+}
+
+struct WatchPostmortemState {
+    enabled: bool,
+    base_url: String,
+    rendered: HashSet<String>,
+}
+
+impl WatchPostmortemState {
+    fn new(enabled: bool, base_url: &str) -> Self {
+        Self {
+            enabled,
+            base_url: base_url.to_string(),
+            rendered: HashSet::new(),
+        }
     }
 }
 
@@ -1384,6 +1429,25 @@ fn render_event(
 
             // Remove after rendering.
             active.remove(session_id);
+        }
+
+        WatchEvent::PostmortemReady {
+            idle_secs,
+            total_tokens,
+            total_turns,
+            ..
+        } => {
+            print_tagged(
+                &tag,
+                &format!(
+                    "POSTMORTEM READY \u{00b7} idle {} \u{00b7} {} tokens \u{00b7} {} turns",
+                    format_duration_coarse(*idle_secs),
+                    format_tokens(*total_tokens),
+                    total_turns
+                )
+                .dimmed()
+                .to_string(),
+            );
         }
 
         WatchEvent::ToolUse {
@@ -1888,6 +1952,219 @@ fn render_diagnosis(report: &DiagnosisReport, tag: &str) {
     println!();
 }
 
+fn json_str<'a>(value: &'a serde_json::Value, pointer: &str) -> Option<&'a str> {
+    value.pointer(pointer).and_then(|value| value.as_str())
+}
+
+fn json_u64(value: &serde_json::Value, pointer: &str) -> Option<u64> {
+    value.pointer(pointer).and_then(|value| value.as_u64())
+}
+
+fn json_f64(value: &serde_json::Value, pointer: &str) -> Option<f64> {
+    value.pointer(pointer).and_then(|value| value.as_f64())
+}
+
+fn json_bool(value: &serde_json::Value, pointer: &str) -> Option<bool> {
+    value.pointer(pointer).and_then(|value| value.as_bool())
+}
+
+fn format_money(value: Option<f64>) -> String {
+    value
+        .map(|amount| format!("${amount:.2}"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn format_percent(value: Option<f64>) -> String {
+    value
+        .map(|amount| format!("{:.0}%", amount * 100.0))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn append_string_array_section(
+    out: &mut String,
+    title: &str,
+    values: Option<&Vec<serde_json::Value>>,
+) {
+    out.push_str(&format!("## {title}\n"));
+    match values {
+        Some(items) if !items.is_empty() => {
+            for item in items {
+                if let Some(text) = item.as_str() {
+                    out.push_str(&format!("- {text}\n"));
+                }
+            }
+        }
+        _ => out.push_str("- None recorded.\n"),
+    }
+    out.push('\n');
+}
+
+fn render_postmortem_markdown(report: &serde_json::Value) -> String {
+    let session_id = json_str(report, "/session_id").unwrap_or("unknown");
+    let redacted = json_bool(report, "/redacted").unwrap_or(false);
+    let partial = json_bool(report, "/partial").unwrap_or(false);
+    let outcome = json_str(report, "/summary/outcome").unwrap_or("unknown");
+    let model = json_str(report, "/summary/model").unwrap_or("unknown");
+    let started_at = json_str(report, "/summary/started_at").unwrap_or("unknown");
+    let ended_at = json_str(report, "/summary/ended_at").unwrap_or("not ended");
+    let duration = json_u64(report, "/summary/duration_secs")
+        .map(format_duration_coarse)
+        .unwrap_or_else(|| "unknown".to_string());
+    let turns = json_u64(report, "/summary/total_turns").unwrap_or(0);
+    let tokens = json_u64(report, "/summary/total_tokens").unwrap_or(0);
+    let likely_cause = json_str(report, "/diagnosis/likely_cause").unwrap_or("none");
+    let cause_detail = json_str(report, "/diagnosis/detail").unwrap_or("No detail recorded.");
+    let confidence = json_str(report, "/diagnosis/confidence").unwrap_or("low");
+    let next_action = json_str(report, "/diagnosis/next_action").unwrap_or("No action recorded.");
+
+    let mut out = String::new();
+    out.push_str("# Clauditor Session Postmortem\n\n");
+    out.push_str("## Summary\n");
+    out.push_str(&format!("- Session: `{session_id}`\n"));
+    out.push_str(&format!(
+        "- Status: {}{}\n",
+        if redacted {
+            "redacted"
+        } else {
+            "local unredacted"
+        },
+        if partial { ", partial" } else { "" }
+    ));
+    out.push_str(&format!("- Outcome: {outcome}\n"));
+    out.push_str(&format!("- Model: {model}\n"));
+    out.push_str(&format!("- Started: {started_at}\n"));
+    out.push_str(&format!("- Ended: {ended_at}\n"));
+    out.push_str(&format!("- Duration: {duration}\n"));
+    out.push_str(&format!(
+        "- Turns: {turns}, tokens: {}\n",
+        format_tokens(tokens)
+    ));
+    if let Some(prompt) = json_str(report, "/summary/initial_prompt_summary") {
+        out.push_str(&format!("- Initial prompt: {prompt}\n"));
+    }
+    if let Some(summary) = json_str(report, "/summary/final_response_summary") {
+        out.push_str(&format!("- Final response: {summary}\n"));
+    }
+    out.push('\n');
+
+    out.push_str("## Likely Cause\n");
+    out.push_str(&format!("- Cause: {likely_cause}\n"));
+    out.push_str(&format!("- Detail: {cause_detail}\n"));
+    out.push_str(&format!("- Confidence: {confidence}\n"));
+    out.push_str(&format!("- Next action: {next_action}\n\n"));
+
+    out.push_str("## Evidence\n");
+    match report.get("evidence").and_then(|value| value.as_array()) {
+        Some(items) if !items.is_empty() => {
+            for item in items {
+                let kind = item
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("evidence");
+                let label = item
+                    .get("label")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("signal");
+                let detail = item
+                    .get("detail")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let turn = item
+                    .get("turn")
+                    .and_then(|value| value.as_u64())
+                    .map(|turn| format!(" turn {turn},"))
+                    .unwrap_or_default();
+                out.push_str(&format!("- [{kind}] {label}:{turn} {detail}\n"));
+            }
+        }
+        _ => out.push_str("- No evidence rows recorded.\n"),
+    }
+    out.push('\n');
+
+    out.push_str("## Token And Cost Impact\n");
+    out.push_str(&format!(
+        "- Total tokens: {} (input {}, cache read {}, cache create {}, output {})\n",
+        format_tokens(json_u64(report, "/impact/total_tokens").unwrap_or(0)),
+        format_tokens(json_u64(report, "/impact/input_tokens").unwrap_or(0)),
+        format_tokens(json_u64(report, "/impact/cache_read_tokens").unwrap_or(0)),
+        format_tokens(json_u64(report, "/impact/cache_creation_tokens").unwrap_or(0)),
+        format_tokens(json_u64(report, "/impact/output_tokens").unwrap_or(0))
+    ));
+    out.push_str(&format!(
+        "- Estimated total cost: {} ({})\n",
+        format_money(json_f64(report, "/impact/estimated_total_cost_dollars")),
+        json_str(report, "/impact/cost_source").unwrap_or("unknown source")
+    ));
+    out.push_str(&format!(
+        "- Estimated likely waste: {} tokens, {}\n",
+        format_tokens(json_u64(report, "/impact/estimated_likely_wasted_tokens").unwrap_or(0)),
+        format_money(json_f64(
+            report,
+            "/impact/estimated_likely_wasted_cost_dollars"
+        ))
+    ));
+    if let Some(billed) = json_f64(report, "/impact/billed_cost_dollars") {
+        out.push_str(&format!("- Billed reconciliation: ${billed:.2}\n"));
+    }
+    out.push_str(&format!(
+        "- Cache hit ratio: {}\n",
+        format_percent(json_f64(report, "/signals/cache/cache_hit_ratio"))
+    ));
+    out.push_str(&format!(
+        "- Context max: {:.0}% full; turns to compact: {}\n",
+        json_f64(report, "/signals/context/max_fill_percent").unwrap_or(0.0),
+        json_u64(report, "/signals/context/turns_to_compact")
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    out.push_str(&format!(
+        "- Caveat: {}\n\n",
+        json_str(report, "/impact/cost_caveat").unwrap_or("Estimated costs are not billing truth.")
+    ));
+
+    out.push_str("## Timeline Highlights\n");
+    match report.get("timeline").and_then(|value| value.as_array()) {
+        Some(items) if !items.is_empty() => {
+            for item in items {
+                let timestamp = item
+                    .get("timestamp")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let label = item
+                    .get("label")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("event");
+                let detail = item
+                    .get("detail")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let turn = item
+                    .get("turn")
+                    .and_then(|value| value.as_u64())
+                    .map(|turn| format!(" turn {turn},"))
+                    .unwrap_or_default();
+                out.push_str(&format!("- {timestamp}:{turn} {label}: {detail}\n"));
+            }
+        }
+        _ => out.push_str("- No timeline highlights recorded.\n"),
+    }
+    out.push('\n');
+
+    append_string_array_section(
+        &mut out,
+        "Recommendations",
+        report
+            .get("recommendations")
+            .and_then(|value| value.as_array()),
+    );
+    append_string_array_section(
+        &mut out,
+        "Caveats",
+        report.get("caveats").and_then(|value| value.as_array()),
+    );
+    out
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -1907,6 +2184,7 @@ async fn main() {
             no_cache,
             no_signals,
             session,
+            no_postmortem,
             tmux,
             tmux_max_panes,
         } => {
@@ -1914,9 +2192,13 @@ async fn main() {
                 // Tmux orchestrator mode. Self-bootstrap into a tmux session
                 // if we're not already inside one, so the user just runs
                 // `clauditor watch --tmux` once.
-                if let Err(e) =
-                    tmux::bootstrap_into_tmux(&url, no_cache, no_signals, tmux_max_panes)
-                {
+                if let Err(e) = tmux::bootstrap_into_tmux(
+                    &url,
+                    no_cache,
+                    no_signals,
+                    no_postmortem,
+                    tmux_max_panes,
+                ) {
                     eprintln!("{}", e.red());
                     std::process::exit(1);
                 }
@@ -1924,6 +2206,7 @@ async fn main() {
                     url.clone(),
                     no_cache,
                     no_signals,
+                    no_postmortem,
                     tmux_max_panes,
                 ) {
                     Ok(o) => o,
@@ -1949,6 +2232,7 @@ async fn main() {
                 };
                 println!("Connecting to {}...", watch_url);
                 let mut active = ActiveSessions::new();
+                let mut postmortem_state = WatchPostmortemState::new(!no_postmortem, &url);
 
                 loop {
                     match connect_and_stream(
@@ -1957,6 +2241,7 @@ async fn main() {
                         no_signals,
                         &session,
                         &mut active,
+                        &mut postmortem_state,
                     )
                     .await
                     {
@@ -1973,6 +2258,14 @@ async fn main() {
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
             }
+        }
+        Commands::Postmortem {
+            url,
+            target,
+            redact,
+            output,
+        } => {
+            std::process::exit(run_postmortem(&url, &target, redact, output.as_deref()).await);
         }
         Commands::Sessions { url, limit, days } => {
             let sessions_url = format!(
@@ -2029,6 +2322,99 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+    }
+}
+
+async fn fetch_postmortem_json(
+    base_url: &str,
+    target: &str,
+    redact: bool,
+) -> Result<serde_json::Value, String> {
+    let url = format!(
+        "{}/api/postmortem/{}",
+        base_url.trim_end_matches('/'),
+        target
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .query(&[("redact", redact.to_string())])
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let detail = body.trim();
+        return if detail.is_empty() {
+            Err(format!("HTTP {status}"))
+        } else {
+            Err(format!("HTTP {status}: {detail}"))
+        };
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+async fn fetch_postmortem_json_with_retry(
+    base_url: &str,
+    target: &str,
+    redact: bool,
+    attempts: usize,
+    retry_delay: Duration,
+) -> Result<serde_json::Value, String> {
+    let attempts = attempts.max(1);
+    let mut last_error = String::new();
+    for attempt in 0..attempts {
+        match fetch_postmortem_json(base_url, target, redact).await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                let retryable = err.contains("HTTP 404") || err.contains("HTTP 503");
+                last_error = err;
+                if !retryable || attempt + 1 == attempts {
+                    break;
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
+    }
+    Err(last_error)
+}
+
+async fn run_postmortem(base_url: &str, target: &str, redact: bool, output: Option<&Path>) -> i32 {
+    match fetch_postmortem_json(base_url, target, redact).await {
+        Ok(report) => {
+            let markdown = render_postmortem_markdown(&report);
+            if let Some(path) = output {
+                if let Some(parent) = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    if let Err(err) = fs::create_dir_all(parent) {
+                        eprintln!(
+                            "{}",
+                            format!("Error: failed to create {}: {}", parent.display(), err).red()
+                        );
+                        return 1;
+                    }
+                }
+                if let Err(err) = fs::write(path, markdown) {
+                    eprintln!(
+                        "{}",
+                        format!("Error: failed to write {}: {}", path.display(), err).red()
+                    );
+                    return 1;
+                }
+                println!("Wrote postmortem to {}", path.display());
+            } else {
+                print!("{markdown}");
+            }
+            0
+        }
+        Err(err) => {
+            eprintln!("{}", format!("Error: {err}").red());
+            1
         }
     }
 }
@@ -2249,6 +2635,7 @@ async fn connect_and_stream(
     no_signals: bool,
     session_filter: &Option<String>,
     active: &mut ActiveSessions,
+    postmortem: &mut WatchPostmortemState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let resp = reqwest::Client::new()
         .get(url)
@@ -2286,6 +2673,35 @@ async fn connect_and_stream(
             } else if line.is_empty() && !data_buffer.is_empty() {
                 if let Ok(event) = serde_json::from_str::<WatchEvent>(&data_buffer) {
                     render_event(&event, no_cache, no_signals, session_filter, active);
+                    if postmortem.enabled {
+                        if let Some((session_id, dedupe_key)) = auto_postmortem_target(&event) {
+                            if postmortem.rendered.insert(dedupe_key) {
+                                match fetch_postmortem_json_with_retry(
+                                    &postmortem.base_url,
+                                    &session_id,
+                                    true,
+                                    5,
+                                    Duration::from_millis(250),
+                                )
+                                .await
+                                {
+                                    Ok(report) => {
+                                        println!();
+                                        print!("{}", render_postmortem_markdown(&report));
+                                    }
+                                    Err(err) => {
+                                        eprintln!(
+                                            "{}",
+                                            format!(
+                                                "Postmortem unavailable for {session_id}: {err}"
+                                            )
+                                            .yellow()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 data_buffer.clear();
             }
@@ -2295,18 +2711,35 @@ async fn connect_and_stream(
     Ok(())
 }
 
+fn auto_postmortem_target(event: &WatchEvent) -> Option<(String, String)> {
+    match event {
+        WatchEvent::SessionEnd {
+            session_id,
+            total_turns,
+            ..
+        }
+        | WatchEvent::PostmortemReady {
+            session_id,
+            total_turns,
+            ..
+        } => Some((session_id.clone(), format!("{session_id}:{total_turns}"))),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_datetime_from_iso, event_session_id, extract_run_watch, format_duration_coarse,
-        format_tokens, local_time_from_iso, parse_mcp_tool_name, push_unique, shell_join,
-        shell_quote, truncate_for_box, yaml_quote, ActiveSessions, Cli, Commands, WatchEvent,
+        auto_postmortem_target, compact_datetime_from_iso, event_session_id, extract_run_watch,
+        format_duration_coarse, format_tokens, local_time_from_iso, parse_mcp_tool_name,
+        push_unique, render_postmortem_markdown, shell_join, shell_quote, truncate_for_box,
+        yaml_quote, ActiveSessions, Cli, Commands, WatchEvent, WatchPostmortemState,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
     use std::fs;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -2362,6 +2795,68 @@ mod tests {
                 stream.flush().expect("flush sse chunk");
                 thread::sleep(Duration::from_millis(5));
             }
+        });
+
+        (url, rx)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut buffer).expect("read request");
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..n]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    fn serve_watch_and_postmortem_once(
+        watch_chunks: Vec<String>,
+        postmortem_status: &str,
+        postmortem_body: &str,
+    ) -> (String, mpsc::Receiver<Vec<String>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind watch server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let status = postmortem_status.to_string();
+        let body = postmortem_body.to_string();
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let mut requests = Vec::new();
+
+            let (mut stream, _) = listener.accept().expect("accept watch request");
+            requests.push(read_http_request(&mut stream));
+            let content_len: usize = watch_chunks.iter().map(|chunk| chunk.len()).sum();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                content_len
+            )
+            .expect("write watch response headers");
+            for chunk in watch_chunks {
+                stream
+                    .write_all(chunk.as_bytes())
+                    .expect("write watch chunk");
+                stream.flush().expect("flush watch chunk");
+            }
+
+            let (mut stream, _) = listener.accept().expect("accept postmortem request");
+            requests.push(read_http_request(&mut stream));
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write postmortem response");
+
+            tx.send(requests).expect("send captured requests");
         });
 
         (url, rx)
@@ -2534,6 +3029,7 @@ mod tests {
             no_cache,
             no_signals,
             session,
+            no_postmortem,
             tmux,
             tmux_max_panes,
         } = cli.command
@@ -2544,8 +3040,16 @@ mod tests {
         assert!(!no_cache);
         assert!(!no_signals);
         assert_eq!(session, None);
+        assert!(!no_postmortem);
         assert!(!tmux);
         assert_eq!(tmux_max_panes, 4);
+
+        let cli = Cli::try_parse_from(["clauditor", "watch", "--no-postmortem"])
+            .expect("watch no-postmortem parses");
+        let Commands::Watch { no_postmortem, .. } = cli.command else {
+            panic!("expected watch command");
+        };
+        assert!(no_postmortem);
 
         let cli = Cli::try_parse_from(["clauditor", "sessions"]).expect("sessions parses");
         let Commands::Sessions { url, limit, days } = cli.command else {
@@ -2569,6 +3073,44 @@ mod tests {
         assert_eq!(limit, 5);
         assert_eq!(days, 30);
         assert_eq!(query, vec!["auth"]);
+
+        let cli = Cli::try_parse_from(["clauditor", "postmortem", "last", "--redact"])
+            .expect("postmortem last parses");
+        let Commands::Postmortem {
+            url,
+            target,
+            redact,
+            output,
+        } = cli.command
+        else {
+            panic!("expected postmortem command");
+        };
+        assert_eq!(url, "http://localhost:9091");
+        assert_eq!(target, "last");
+        assert!(redact);
+        assert_eq!(output, None);
+
+        let cli = Cli::try_parse_from([
+            "clauditor",
+            "postmortem",
+            "session_1234_abcd",
+            "--redact",
+            "--output",
+            "postmortem.md",
+        ])
+        .expect("postmortem session parses");
+        let Commands::Postmortem {
+            target,
+            redact,
+            output,
+            ..
+        } = cli.command
+        else {
+            panic!("expected postmortem command");
+        };
+        assert_eq!(target, "session_1234_abcd");
+        assert!(redact);
+        assert_eq!(output, Some(std::path::PathBuf::from("postmortem.md")));
     }
 
     #[test]
@@ -2617,10 +3159,18 @@ mod tests {
         let (url, request_rx) = serve_sse_chunks_once(chunks);
         let mut active = ActiveSessions::new();
         let filter = Some("session_target".to_string());
+        let mut postmortem_state = WatchPostmortemState::new(false, &url);
 
-        super::connect_and_stream(&url, false, false, &filter, &mut active)
-            .await
-            .expect("watch stream closes cleanly");
+        super::connect_and_stream(
+            &url,
+            false,
+            false,
+            &filter,
+            &mut active,
+            &mut postmortem_state,
+        )
+        .await
+        .expect("watch stream closes cleanly");
 
         let request = request_rx
             .recv_timeout(Duration::from_secs(2))
@@ -2639,6 +3189,264 @@ mod tests {
             active.sessions.is_empty(),
             "target session should be removed after session_end"
         );
+    }
+
+    #[test]
+    fn postmortem_markdown_renderer_includes_expected_sections() {
+        let report = serde_json::json!({
+            "session_id": "session_target",
+            "redacted": true,
+            "partial": false,
+            "summary": {
+                "started_at": "2026-01-01T00:00:00Z",
+                "ended_at": "2026-01-01T00:05:00Z",
+                "duration_secs": 300,
+                "model": "claude-sonnet",
+                "outcome": "Likely Partially Completed",
+                "total_turns": 4,
+                "total_tokens": 123456,
+                "initial_prompt_summary": "Initial prompt captured (redacted, 8 words).",
+                "final_response_summary": "Final response summary captured (redacted, 6 words)."
+            },
+            "diagnosis": {
+                "likely_cause": "tool_failure_streak",
+                "detail": "Bash failed repeatedly.",
+                "confidence": "high",
+                "next_action": "Fix the failing command, then restart."
+            },
+            "impact": {
+                "input_tokens": 100000,
+                "output_tokens": 1000,
+                "cache_read_tokens": 20000,
+                "cache_creation_tokens": 2456,
+                "total_tokens": 123456,
+                "estimated_total_cost_dollars": 1.23,
+                "estimated_likely_wasted_tokens": 2456,
+                "estimated_likely_wasted_cost_dollars": 0.12,
+                "cost_source": "builtin_model_family_pricing",
+                "cost_caveat": "Estimated costs are local calculations, not authoritative billing records."
+            },
+            "signals": {
+                "cache": { "cache_hit_ratio": 0.75 },
+                "context": { "max_fill_percent": 82.0, "turns_to_compact": 1 }
+            },
+            "evidence": [
+                { "type": "direct", "label": "tools", "detail": "3 tool failures", "turn": 2 }
+            ],
+            "timeline": [
+                { "timestamp": "2026-01-01T00:00:00Z", "label": "session_started", "detail": "Session row created." },
+                { "timestamp": "2026-01-01T00:05:00Z", "label": "session_ended", "detail": "Likely Partially Completed" }
+            ],
+            "recommendations": ["Fix the failing command, then restart."],
+            "caveats": ["This report is deterministic and generated from local Clauditor SQLite data."]
+        });
+
+        let markdown = render_postmortem_markdown(&report);
+        assert!(markdown.contains("# Clauditor Session Postmortem"));
+        assert!(markdown.contains("## Summary"));
+        assert!(markdown.contains("## Likely Cause"));
+        assert!(markdown.contains("## Evidence"));
+        assert!(markdown.contains("## Token And Cost Impact"));
+        assert!(markdown.contains("## Timeline Highlights"));
+        assert!(markdown.contains("## Recommendations"));
+        assert!(markdown.contains("## Caveats"));
+        assert!(markdown.contains("Session: `session_target`"));
+        assert!(markdown.contains("Initial prompt captured (redacted"));
+        assert!(markdown.contains("Estimated costs are local calculations"));
+    }
+
+    #[tokio::test]
+    async fn watch_stream_fetches_redacted_postmortem_on_session_end() {
+        let chunks = vec![concat!(
+            "data: {\"type\":\"session_end\",\"session_id\":\"session_target\",",
+            "\"outcome\":\"Likely Completed\",\"total_tokens\":1234,\"total_turns\":3}\n\n"
+        )
+        .to_string()];
+        let body = serde_json::json!({
+            "session_id": "session_target",
+            "redacted": true,
+            "partial": false,
+            "summary": {
+                "started_at": "2026-01-01T00:00:00Z",
+                "ended_at": "2026-01-01T00:01:00Z",
+                "duration_secs": 60,
+                "model": "claude-sonnet",
+                "outcome": "Likely Completed",
+                "total_turns": 3,
+                "total_tokens": 1234
+            },
+            "diagnosis": {
+                "likely_cause": "none",
+                "detail": "No primary degradation cause was recorded.",
+                "confidence": "low",
+                "next_action": "Continue."
+            },
+            "impact": {
+                "input_tokens": 1000,
+                "output_tokens": 234,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "total_tokens": 1234,
+                "estimated_total_cost_dollars": 0.01,
+                "estimated_likely_wasted_tokens": 0,
+                "estimated_likely_wasted_cost_dollars": 0.0,
+                "cost_source": "builtin_model_family_pricing",
+                "cost_caveat": "Estimated costs are local calculations, not authoritative billing records."
+            },
+            "signals": {
+                "cache": { "cache_hit_ratio": 0.0 },
+                "context": { "max_fill_percent": 1.0, "turns_to_compact": null }
+            },
+            "evidence": [],
+            "timeline": [],
+            "recommendations": ["Continue."],
+            "caveats": []
+        })
+        .to_string();
+        let (url, request_rx) = serve_watch_and_postmortem_once(chunks, "200 OK", &body);
+        let mut active = ActiveSessions::new();
+        let filter = None;
+        let mut postmortem_state = WatchPostmortemState::new(true, &url);
+
+        super::connect_and_stream(
+            &url,
+            false,
+            false,
+            &filter,
+            &mut active,
+            &mut postmortem_state,
+        )
+        .await
+        .expect("watch stream closes cleanly");
+
+        let requests = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("GET /api/postmortem/session_target?redact=true "));
+        assert!(postmortem_state.rendered.contains("session_target:3"));
+        assert_eq!(
+            auto_postmortem_target(&WatchEvent::SessionEnd {
+                session_id: "session_target".to_string(),
+                outcome: "Likely Completed".to_string(),
+                total_tokens: 1,
+                total_turns: 1,
+            }),
+            Some(("session_target".to_string(), "session_target:1".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_stream_fetches_redacted_postmortem_on_idle_checkpoint() {
+        let chunks = vec![concat!(
+            "data: {\"type\":\"postmortem_ready\",\"session_id\":\"session_target\",",
+            "\"idle_secs\":90,\"total_tokens\":1234,\"total_turns\":3}\n\n"
+        )
+        .to_string()];
+        let body = serde_json::json!({
+            "session_id": "session_target",
+            "redacted": true,
+            "partial": true,
+            "summary": {
+                "started_at": "2026-01-01T00:00:00Z",
+                "ended_at": null,
+                "duration_secs": 60,
+                "model": "claude-sonnet",
+                "outcome": "In Progress",
+                "total_turns": 3,
+                "total_tokens": 1234
+            },
+            "diagnosis": {
+                "likely_cause": "none",
+                "detail": "No primary degradation cause was recorded.",
+                "confidence": "low",
+                "next_action": "Continue."
+            },
+            "impact": {
+                "input_tokens": 1000,
+                "output_tokens": 234,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "total_tokens": 1234,
+                "estimated_total_cost_dollars": 0.01,
+                "estimated_likely_wasted_tokens": 0,
+                "estimated_likely_wasted_cost_dollars": 0.0,
+                "cost_source": "builtin_model_family_pricing",
+                "cost_caveat": "Estimated costs are local calculations, not authoritative billing records."
+            },
+            "signals": {
+                "cache": { "cache_hit_ratio": 0.0 },
+                "context": { "max_fill_percent": 1.0, "turns_to_compact": null }
+            },
+            "evidence": [],
+            "timeline": [],
+            "recommendations": ["Continue."],
+            "caveats": []
+        })
+        .to_string();
+        let (url, request_rx) = serve_watch_and_postmortem_once(chunks, "200 OK", &body);
+        let mut active = ActiveSessions::new();
+        let filter = None;
+        let mut postmortem_state = WatchPostmortemState::new(true, &url);
+
+        super::connect_and_stream(
+            &url,
+            false,
+            false,
+            &filter,
+            &mut active,
+            &mut postmortem_state,
+        )
+        .await
+        .expect("watch stream closes cleanly");
+
+        let requests = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("GET /api/postmortem/session_target?redact=true "));
+        assert!(postmortem_state.rendered.contains("session_target:3"));
+        assert_eq!(
+            auto_postmortem_target(&WatchEvent::PostmortemReady {
+                session_id: "session_target".to_string(),
+                idle_secs: 90,
+                total_tokens: 1,
+                total_turns: 1,
+            }),
+            Some(("session_target".to_string(), "session_target:1".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_stream_postmortem_failure_does_not_terminate_stream() {
+        let chunks = vec![concat!(
+            "data: {\"type\":\"session_end\",\"session_id\":\"session_target\",",
+            "\"outcome\":\"Likely Completed\",\"total_tokens\":1234,\"total_turns\":3}\n\n"
+        )
+        .to_string()];
+        let (url, request_rx) =
+            serve_watch_and_postmortem_once(chunks, "500 Internal Server Error", "broken");
+        let mut active = ActiveSessions::new();
+        let filter = None;
+        let mut postmortem_state = WatchPostmortemState::new(true, &url);
+
+        super::connect_and_stream(
+            &url,
+            false,
+            false,
+            &filter,
+            &mut active,
+            &mut postmortem_state,
+        )
+        .await
+        .expect("postmortem failure should not close watch with an error");
+
+        let requests = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("GET /api/postmortem/session_target?redact=true "));
+        assert!(postmortem_state.rendered.contains("session_target:3"));
     }
 
     #[test]
