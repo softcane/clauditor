@@ -12,6 +12,7 @@ use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -69,6 +70,14 @@ enum Commands {
         #[arg(long)]
         no_postmortem: bool,
 
+        /// Ask Claude to synthesize the automatic postmortem (default)
+        #[arg(long, conflicts_with = "no_analyze_with_claude")]
+        analyze_with_claude: bool,
+
+        /// Render deterministic local postmortems without asking Claude
+        #[arg(long)]
+        no_analyze_with_claude: bool,
+
         /// Split each session into its own tmux pane
         #[arg(long, conflicts_with = "session")]
         tmux: bool,
@@ -93,7 +102,7 @@ enum Commands {
         days: u32,
     },
 
-    /// Generate a deterministic markdown postmortem for a session
+    /// Generate a markdown postmortem for a session
     Postmortem {
         /// Base URL of clauditor-core
         #[arg(long, default_value = "http://localhost:9091")]
@@ -105,6 +114,14 @@ enum Commands {
         /// Redact prompts, paths, query strings, tool payloads, and secret-like values
         #[arg(long)]
         redact: bool,
+
+        /// Ask Claude to synthesize the postmortem (default)
+        #[arg(long, conflicts_with = "no_analyze_with_claude")]
+        analyze_with_claude: bool,
+
+        /// Render only the deterministic local postmortem
+        #[arg(long)]
+        no_analyze_with_claude: bool,
 
         /// Write markdown to this file instead of stdout
         #[arg(long)]
@@ -1281,14 +1298,16 @@ impl ActiveSessions {
 struct WatchPostmortemState {
     enabled: bool,
     base_url: String,
+    analyze_with_claude: bool,
     rendered: HashSet<String>,
 }
 
 impl WatchPostmortemState {
-    fn new(enabled: bool, base_url: &str) -> Self {
+    fn new(enabled: bool, base_url: &str, analyze_with_claude: bool) -> Self {
         Self {
             enabled,
             base_url: base_url.to_string(),
+            analyze_with_claude,
             rendered: HashSet::new(),
         }
     }
@@ -2165,6 +2184,148 @@ fn render_postmortem_markdown(report: &serde_json::Value) -> String {
     out
 }
 
+fn claude_analysis_enabled(analyze_with_claude: bool, no_analyze_with_claude: bool) -> bool {
+    analyze_with_claude || !no_analyze_with_claude
+}
+
+fn append_claude_analysis_section(markdown: &mut String, analysis: &str) {
+    let trimmed = analysis.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !markdown.ends_with('\n') {
+        markdown.push('\n');
+    }
+    markdown.push('\n');
+    if trimmed.starts_with("## Claude Analysis") {
+        markdown.push_str(trimmed);
+    } else {
+        markdown.push_str("## Claude Analysis\n");
+        markdown.push_str(trimmed);
+    }
+    markdown.push('\n');
+}
+
+fn build_claude_analysis_prompt(report: &serde_json::Value) -> String {
+    let bundle = serde_json::to_string_pretty(report).unwrap_or_else(|_| report.to_string());
+    let bundle = truncate_for_box(&bundle, 24_000);
+    format!(
+        "You are Clauditor's postmortem analyst.\n\
+Use only the redacted JSON evidence below. Do not invent facts, files, commands, or raw prompts.\n\
+Write concise GitHub-flavored Markdown. Keep it under 350 words.\n\
+Include exactly these sections:\n\
+## Claude Analysis\n\
+- Likely cause: ...\n\
+- Confidence: high|medium|low, with one short reason.\n\
+- What changed the user's decision: ...\n\
+- Next action: ...\n\
+## Restart Prompt\n\
+One short prompt the user can paste into a fresh Claude Code session, or \"No restart needed.\".\n\
+Preserve caveats: costs are estimates, context runway is heuristic, and redacted evidence may omit details.\n\n\
+Redacted Clauditor postmortem JSON:\n```json\n{bundle}\n```"
+    )
+}
+
+async fn run_claude_postmortem_analysis_with_command(
+    command: &Path,
+    report: &serde_json::Value,
+    timeout: Duration,
+) -> Result<String, String> {
+    let prompt = build_claude_analysis_prompt(report);
+    let mut child = tokio::process::Command::new(command)
+        .arg("-p")
+        .arg("--output-format")
+        .arg("text")
+        .arg("--no-session-persistence")
+        .arg("--max-budget-usd")
+        .arg("0.25")
+        .arg("--tools")
+        .arg("")
+        .env_remove("ANTHROPIC_BASE_URL")
+        .env("CLAUDITOR_POSTMORTEM_ANALYSIS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|err| format!("failed to start claude: {err}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open claude stdin".to_string())?;
+    stdin
+        .write_all(prompt.as_bytes())
+        .await
+        .map_err(|err| format!("failed to write claude prompt: {err}"))?;
+    drop(stdin);
+
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| "claude analysis timed out".to_string())?
+        .map_err(|err| format!("failed to wait for claude: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return if stderr.is_empty() {
+            Err(format!("claude exited with {}", output.status))
+        } else {
+            Err(format!("claude exited with {}: {stderr}", output.status))
+        };
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        Err("claude returned empty analysis".to_string())
+    } else {
+        Ok(truncate_for_box(&stdout, 12_000))
+    }
+}
+
+async fn run_claude_postmortem_analysis(report: &serde_json::Value) -> Result<String, String> {
+    let claude = command_path("claude").ok_or_else(|| "claude command not found".to_string())?;
+    run_claude_postmortem_analysis_with_command(&claude, report, Duration::from_secs(120)).await
+}
+
+async fn render_postmortem_markdown_with_optional_analysis(
+    base_url: &str,
+    target: &str,
+    report: &serde_json::Value,
+    analyze_with_claude: bool,
+) -> (String, Option<String>) {
+    let mut markdown = render_postmortem_markdown(report);
+    if !analyze_with_claude {
+        return (markdown, None);
+    }
+
+    let redacted_report = if json_bool(report, "/redacted").unwrap_or(false) {
+        report.clone()
+    } else {
+        match fetch_postmortem_json(base_url, target, true).await {
+            Ok(value) => value,
+            Err(err) => {
+                return (
+                    markdown,
+                    Some(format!(
+                        "Claude analysis skipped because redacted evidence could not be fetched: {err}"
+                    )),
+                );
+            }
+        }
+    };
+
+    match run_claude_postmortem_analysis(&redacted_report).await {
+        Ok(analysis) => {
+            append_claude_analysis_section(&mut markdown, &analysis);
+            (markdown, None)
+        }
+        Err(err) => (
+            markdown,
+            Some(format!("Claude analysis unavailable: {err}")),
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -2185,9 +2346,13 @@ async fn main() {
             no_signals,
             session,
             no_postmortem,
+            analyze_with_claude,
+            no_analyze_with_claude,
             tmux,
             tmux_max_panes,
         } => {
+            let analyze_postmortems =
+                claude_analysis_enabled(analyze_with_claude, no_analyze_with_claude);
             if tmux {
                 // Tmux orchestrator mode. Self-bootstrap into a tmux session
                 // if we're not already inside one, so the user just runs
@@ -2197,6 +2362,7 @@ async fn main() {
                     no_cache,
                     no_signals,
                     no_postmortem,
+                    !analyze_postmortems,
                     tmux_max_panes,
                 ) {
                     eprintln!("{}", e.red());
@@ -2207,6 +2373,7 @@ async fn main() {
                     no_cache,
                     no_signals,
                     no_postmortem,
+                    !analyze_postmortems,
                     tmux_max_panes,
                 ) {
                     Ok(o) => o,
@@ -2232,7 +2399,8 @@ async fn main() {
                 };
                 println!("Connecting to {}...", watch_url);
                 let mut active = ActiveSessions::new();
-                let mut postmortem_state = WatchPostmortemState::new(!no_postmortem, &url);
+                let mut postmortem_state =
+                    WatchPostmortemState::new(!no_postmortem, &url, analyze_postmortems);
 
                 loop {
                     match connect_and_stream(
@@ -2263,9 +2431,15 @@ async fn main() {
             url,
             target,
             redact,
+            analyze_with_claude,
+            no_analyze_with_claude,
             output,
         } => {
-            std::process::exit(run_postmortem(&url, &target, redact, output.as_deref()).await);
+            let analyze_postmortem =
+                claude_analysis_enabled(analyze_with_claude, no_analyze_with_claude);
+            std::process::exit(
+                run_postmortem(&url, &target, redact, analyze_postmortem, output.as_deref()).await,
+            );
         }
         Commands::Sessions { url, limit, days } => {
             let sessions_url = format!(
@@ -2382,10 +2556,25 @@ async fn fetch_postmortem_json_with_retry(
     Err(last_error)
 }
 
-async fn run_postmortem(base_url: &str, target: &str, redact: bool, output: Option<&Path>) -> i32 {
+async fn run_postmortem(
+    base_url: &str,
+    target: &str,
+    redact: bool,
+    analyze_with_claude: bool,
+    output: Option<&Path>,
+) -> i32 {
     match fetch_postmortem_json(base_url, target, redact).await {
         Ok(report) => {
-            let markdown = render_postmortem_markdown(&report);
+            let (markdown, warning) = render_postmortem_markdown_with_optional_analysis(
+                base_url,
+                target,
+                &report,
+                analyze_with_claude,
+            )
+            .await;
+            if let Some(warning) = warning {
+                eprintln!("{}", warning.yellow());
+            }
             if let Some(path) = output {
                 if let Some(parent) = path
                     .parent()
@@ -2686,8 +2875,19 @@ async fn connect_and_stream(
                                 .await
                                 {
                                     Ok(report) => {
+                                        let (markdown, warning) =
+                                            render_postmortem_markdown_with_optional_analysis(
+                                                &postmortem.base_url,
+                                                &session_id,
+                                                &report,
+                                                postmortem.analyze_with_claude,
+                                            )
+                                            .await;
+                                        if let Some(warning) = warning {
+                                            eprintln!("{}", warning.yellow());
+                                        }
                                         println!();
-                                        print!("{}", render_postmortem_markdown(&report));
+                                        print!("{markdown}");
                                     }
                                     Err(err) => {
                                         eprintln!(
@@ -2730,10 +2930,12 @@ fn auto_postmortem_target(event: &WatchEvent) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_postmortem_target, compact_datetime_from_iso, event_session_id, extract_run_watch,
+        append_claude_analysis_section, auto_postmortem_target, build_claude_analysis_prompt,
+        claude_analysis_enabled, compact_datetime_from_iso, event_session_id, extract_run_watch,
         format_duration_coarse, format_tokens, local_time_from_iso, parse_mcp_tool_name,
-        push_unique, render_postmortem_markdown, shell_join, shell_quote, truncate_for_box,
-        yaml_quote, ActiveSessions, Cli, Commands, WatchEvent, WatchPostmortemState,
+        push_unique, render_postmortem_markdown, run_claude_postmortem_analysis_with_command,
+        shell_join, shell_quote, truncate_for_box, yaml_quote, ActiveSessions, Cli, Commands,
+        WatchEvent, WatchPostmortemState,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
@@ -3030,6 +3232,8 @@ mod tests {
             no_signals,
             session,
             no_postmortem,
+            analyze_with_claude,
+            no_analyze_with_claude,
             tmux,
             tmux_max_panes,
         } = cli.command
@@ -3041,6 +3245,10 @@ mod tests {
         assert!(!no_signals);
         assert_eq!(session, None);
         assert!(!no_postmortem);
+        assert!(claude_analysis_enabled(
+            analyze_with_claude,
+            no_analyze_with_claude
+        ));
         assert!(!tmux);
         assert_eq!(tmux_max_panes, 4);
 
@@ -3080,6 +3288,8 @@ mod tests {
             url,
             target,
             redact,
+            analyze_with_claude,
+            no_analyze_with_claude,
             output,
         } = cli.command
         else {
@@ -3088,7 +3298,31 @@ mod tests {
         assert_eq!(url, "http://localhost:9091");
         assert_eq!(target, "last");
         assert!(redact);
+        assert!(claude_analysis_enabled(
+            analyze_with_claude,
+            no_analyze_with_claude
+        ));
         assert_eq!(output, None);
+
+        let cli = Cli::try_parse_from([
+            "clauditor",
+            "postmortem",
+            "last",
+            "--no-analyze-with-claude",
+        ])
+        .expect("postmortem no-analyze parses");
+        let Commands::Postmortem {
+            analyze_with_claude,
+            no_analyze_with_claude,
+            ..
+        } = cli.command
+        else {
+            panic!("expected postmortem command");
+        };
+        assert!(!claude_analysis_enabled(
+            analyze_with_claude,
+            no_analyze_with_claude
+        ));
 
         let cli = Cli::try_parse_from([
             "clauditor",
@@ -3159,7 +3393,7 @@ mod tests {
         let (url, request_rx) = serve_sse_chunks_once(chunks);
         let mut active = ActiveSessions::new();
         let filter = Some("session_target".to_string());
-        let mut postmortem_state = WatchPostmortemState::new(false, &url);
+        let mut postmortem_state = WatchPostmortemState::new(false, &url, false);
 
         super::connect_and_stream(
             &url,
@@ -3255,6 +3489,74 @@ mod tests {
         assert!(markdown.contains("Estimated costs are local calculations"));
     }
 
+    #[test]
+    fn postmortem_markdown_appends_claude_analysis_section() {
+        let mut markdown = "# Clauditor Session Postmortem\n".to_string();
+        append_claude_analysis_section(
+            &mut markdown,
+            "- Likely cause: cache rebuild\n- Next action: restart",
+        );
+        assert!(markdown.contains("## Claude Analysis"));
+        assert!(markdown.contains("Likely cause: cache rebuild"));
+    }
+
+    #[test]
+    fn claude_analysis_prompt_uses_redacted_evidence_contract() {
+        let report = serde_json::json!({
+            "session_id": "session_target",
+            "redacted": true,
+            "summary": {
+                "initial_prompt_summary": "Initial prompt captured (redacted, 8 words)."
+            }
+        });
+        let prompt = build_claude_analysis_prompt(&report);
+        assert!(prompt.contains("Use only the redacted JSON evidence"));
+        assert!(prompt.contains("## Claude Analysis"));
+        assert!(prompt.contains("## Restart Prompt"));
+        assert!(prompt.contains("\"redacted\": true"));
+        assert!(prompt.contains("Initial prompt captured"));
+    }
+
+    #[tokio::test]
+    async fn claude_analysis_runner_accepts_fake_claude_command() {
+        let dir = unique_test_dir("fake-claude");
+        let executable = dir.join("claude");
+        {
+            let mut file = fs::File::create(&executable).expect("create fake claude");
+            writeln!(file, "#!/bin/sh").expect("write fake claude");
+            writeln!(file, "cat >/dev/null").expect("write fake claude");
+            writeln!(file, "printf '%s\\n' '## Claude Analysis'").expect("write fake claude");
+            writeln!(file, "printf '%s\\n' '- Likely cause: cache rebuild'")
+                .expect("write fake claude");
+            writeln!(file, "printf '%s\\n' '## Restart Prompt'").expect("write fake claude");
+            writeln!(file, "printf '%s\\n' 'Start fresh with a summary.'")
+                .expect("write fake claude");
+        }
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&executable).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&executable, permissions).expect("chmod fake claude");
+        }
+
+        let report = serde_json::json!({
+            "session_id": "session_target",
+            "redacted": true,
+            "summary": {"outcome": "Likely Completed"}
+        });
+        let analysis = run_claude_postmortem_analysis_with_command(
+            &executable,
+            &report,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("fake claude analysis");
+
+        assert!(analysis.contains("## Claude Analysis"));
+        assert!(analysis.contains("cache rebuild"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn watch_stream_fetches_redacted_postmortem_on_session_end() {
         let chunks = vec![concat!(
@@ -3306,7 +3608,7 @@ mod tests {
         let (url, request_rx) = serve_watch_and_postmortem_once(chunks, "200 OK", &body);
         let mut active = ActiveSessions::new();
         let filter = None;
-        let mut postmortem_state = WatchPostmortemState::new(true, &url);
+        let mut postmortem_state = WatchPostmortemState::new(true, &url, false);
 
         super::connect_and_stream(
             &url,
@@ -3387,7 +3689,7 @@ mod tests {
         let (url, request_rx) = serve_watch_and_postmortem_once(chunks, "200 OK", &body);
         let mut active = ActiveSessions::new();
         let filter = None;
-        let mut postmortem_state = WatchPostmortemState::new(true, &url);
+        let mut postmortem_state = WatchPostmortemState::new(true, &url, false);
 
         super::connect_and_stream(
             &url,
@@ -3428,7 +3730,7 @@ mod tests {
             serve_watch_and_postmortem_once(chunks, "500 Internal Server Error", "broken");
         let mut active = ActiveSessions::new();
         let filter = None;
-        let mut postmortem_state = WatchPostmortemState::new(true, &url);
+        let mut postmortem_state = WatchPostmortemState::new(true, &url, false);
 
         super::connect_and_stream(
             &url,

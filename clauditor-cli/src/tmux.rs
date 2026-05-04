@@ -37,6 +37,7 @@ pub fn bootstrap_into_tmux(
     no_cache: bool,
     no_signals: bool,
     no_postmortem: bool,
+    no_analyze_with_claude: bool,
     tmux_max_panes: usize,
 ) -> Result<(), String> {
     if std::env::var("TMUX").is_ok() {
@@ -75,6 +76,9 @@ pub fn bootstrap_into_tmux(
     }
     if no_postmortem {
         args.push("--no-postmortem".into());
+    }
+    if no_analyze_with_claude {
+        args.push("--no-analyze-with-claude".into());
     }
 
     use std::os::unix::process::CommandExt;
@@ -243,6 +247,7 @@ fn build_child_watch_command(
     no_cache: bool,
     no_signals: bool,
     no_postmortem: bool,
+    no_analyze_with_claude: bool,
 ) -> String {
     let mut cmd_parts = vec![
         cli_path.to_string(),
@@ -260,6 +265,9 @@ fn build_child_watch_command(
     }
     if no_postmortem {
         cmd_parts.push("--no-postmortem".to_string());
+    }
+    if no_analyze_with_claude {
+        cmd_parts.push("--no-analyze-with-claude".to_string());
     }
     shell_join(&cmd_parts)
 }
@@ -306,6 +314,7 @@ pub struct TmuxOrchestrator {
     no_cache: bool,
     no_signals: bool,
     no_postmortem: bool,
+    no_analyze_with_claude: bool,
     max_panes: usize,
     rate_limit: Option<RateLimitSummary>,
 }
@@ -316,6 +325,7 @@ impl TmuxOrchestrator {
         no_cache: bool,
         no_signals: bool,
         no_postmortem: bool,
+        no_analyze_with_claude: bool,
         max_panes: usize,
     ) -> Result<Self, String> {
         let own_pane_id = get_own_pane_id()?;
@@ -331,6 +341,7 @@ impl TmuxOrchestrator {
             no_cache,
             no_signals,
             no_postmortem,
+            no_analyze_with_claude,
             max_panes,
             rate_limit: None,
         };
@@ -353,6 +364,7 @@ impl TmuxOrchestrator {
             self.no_cache,
             self.no_signals,
             self.no_postmortem,
+            self.no_analyze_with_claude,
         );
 
         // Determine split strategy.
@@ -1068,6 +1080,7 @@ mod tests {
             no_cache: false,
             no_signals: false,
             no_postmortem: false,
+            no_analyze_with_claude: false,
             max_panes,
             rate_limit: None,
         }
@@ -1102,6 +1115,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             "clauditor watch --session session_a --url http://localhost:9091"
         );
@@ -1114,8 +1128,9 @@ mod tests {
                 true,
                 true,
                 true,
+                true,
             ),
-            "'/tmp/clauditor cli' watch --session 'session with spaces' --url 'http://localhost:9091/watch?session=session with spaces' --no-cache --no-signals --no-postmortem"
+            "'/tmp/clauditor cli' watch --session 'session with spaces' --url 'http://localhost:9091/watch?session=session with spaces' --no-cache --no-signals --no-postmortem --no-analyze-with-claude"
         );
     }
 
