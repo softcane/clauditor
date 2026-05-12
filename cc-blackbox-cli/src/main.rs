@@ -3319,11 +3319,12 @@ fn colorize_postmortem_value(label: &str, value: &str) -> String {
     match label {
         "State" => postmortem_green_bold(value),
         "Outcome" => {
-            if lower.contains("degraded") || lower.contains("failed") || lower.contains("error") {
-                postmortem_green_bold(value)
-            } else if lower.contains("complete") {
-                postmortem_green_bold(value)
-            } else if lower.contains("progress") {
+            if lower.contains("degraded")
+                || lower.contains("failed")
+                || lower.contains("error")
+                || lower.contains("complete")
+                || lower.contains("progress")
+            {
                 postmortem_green_bold(value)
             } else {
                 value.to_string()
@@ -3989,9 +3990,9 @@ fn finding_terminal_lines(finding: &FindingRow, width: usize) -> Vec<TerminalLin
             || lower.contains("cooldown")
             || lower.contains("critical")
             || lower.contains("budget exceeded")
+            || lower.contains("warn")
+            || lower.contains("warning")
         {
-            postmortem_green_bold(line)
-        } else if lower.contains("warn") || lower.contains("warning") {
             postmortem_green_bold(line)
         } else {
             line.bright_white().to_string()
